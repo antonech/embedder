@@ -4,7 +4,8 @@
     "embedder": {
       "type": "local",
       "command": ["/home/anton/project/embedder/venv/bin/python", "/home/anton/project/embedder/mcp_server.py", "--model", "all-MiniLM-L6-v2"],
-      "enabled": true
+      "enabled": true,
+      "timeout": 30000
     }
   }
 }

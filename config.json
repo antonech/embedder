@@ -1,0 +1,5 @@
+{
+    "embeddings_file": "embeddings.npz",
+    "model_name": "all-MiniLM-L6-v2",
+    "top_k": 5
+}

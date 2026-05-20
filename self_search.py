@@ -1,33 +1,60 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+import json, glob
 from embedder import EmbeddingModel, VectorStore, StorageIO
 
 
-def embed_file(path: str, chunk_size: int = 1):
-    model = EmbeddingModel()
-    store = VectorStore()
-
+def load_config(path="config.json"):
     with open(path) as f:
-        lines = f.readlines()
+        return json.load(f)
 
-    if chunk_size > 1:
-        chunks = ["".join(lines[i:i+chunk_size]) for i in range(0, len(lines), chunk_size)]
-    else:
-        chunks = [l.rstrip("\n") for l in lines]
 
-    vecs = model.embed_many(chunks)
-    store.add_many(vecs, chunks)
+def scan_files(root=".", exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/"}):
+    exts = {".py", ".md", ".txt", ".json", ".sh", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
+    files = []
+    for ext in exts:
+        files.extend(glob.glob(f"{root}/**/*{ext}", recursive=True))
+    return [f for f in files if not any(x in f for x in exclude)]
+
+
+def build_store(cfg):
+    path = cfg["embeddings_file"]
+    if os.path.exists(path):
+        print(f"Loading existing: {path}")
+        vecs, texts, dim = StorageIO.load(path)
+        store = VectorStore()
+        store.vectors = vecs
+        store.texts = texts
+        model = EmbeddingModel(cfg["model_name"])
+        return model, store
+
+    model = EmbeddingModel(cfg["model_name"])
+    store = VectorStore()
+    files = scan_files()
+    total = 0
+    for f in files:
+        with open(f, errors="ignore") as fh:
+            lines = fh.readlines()
+        chunks = [l.rstrip() for l in lines]
+        texts = [f"{f}:{i+1} {t}" for i, t in enumerate(chunks)]
+        vecs = model.embed_many(chunks)
+        store.add_many(vecs, texts)
+        total += len(chunks)
+        print(f"  {f}: {len(chunks)}")
+    StorageIO.save(path, store.vectors, store.texts, model.dim)
+    print(f"Saved {total} lines to {path}")
     return model, store
 
 
 if __name__ == "__main__":
-    model, store = embed_file("embedder.py")
+    cfg = load_config()
+    model, store = build_store(cfg)
 
     while True:
         q = input("\n> ").strip()
         if not q or q in ("exit", "quit"):
             break
-        results = store.search(model.embed(q), top_k=3)
+        results = store.search(model.embed(q), top_k=cfg["top_k"])
         for r in results:
             print(f"  [{r['score']:.3f}] {r['text']}")

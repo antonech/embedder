@@ -1,4 +1,5 @@
 import json
+import asyncio
 import argparse
 from mcp.server.fastmcp import FastMCP
 from embedder import EmbeddingModel, StorageIO, VectorStore
@@ -115,7 +116,7 @@ def save_store(path: str) -> str:
     return app.save(path)
 
 
-def main():
+async def main():
     global app
 
     parser = argparse.ArgumentParser()
@@ -127,8 +128,8 @@ def main():
     if args.data:
         app.init(args.data)
 
-    mcp.run_stdio_async()
+    await mcp.run_stdio_async()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
