@@ -28,10 +28,13 @@ from embedder import EmbeddingModel, VectorStore, StorageIO, ASTParser
 project = os.environ['PROJECT']
 cfg_path = os.path.join(project, 'config.json')
 model_name = 'all-MiniLM-L6-v2'
+device = None
 if os.path.exists(cfg_path):
     with open(cfg_path) as f:
-        model_name = json.load(f).get('model_name', model_name)
-enc = EmbeddingModel(model_name)
+        cfg = json.load(f)
+        model_name = cfg.get('model_name', model_name)
+        device = cfg.get('device')
+enc = EmbeddingModel(model_name, device=device)
 store = VectorStore()
 
 chunks = ASTParser.scan_project(project)

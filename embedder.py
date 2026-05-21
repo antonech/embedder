@@ -1,5 +1,4 @@
 import os, json, ast, re as _re
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 import numpy as np
 from typing import Optional
@@ -421,7 +420,7 @@ ASTParser.register('*.rs', ASTParser._parse_treesitter)
 class EmbeddingModel:
     """Wraps a SentenceTransformer model for producing embeddings."""
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = "cpu"):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = None):
         self.model = SentenceTransformer(model_name, device=device)
         self.dim = self.model.get_embedding_dimension()
 

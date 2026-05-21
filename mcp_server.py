@@ -8,8 +8,8 @@ from tree_search import TreeIndex
 
 
 class EmbedderApp:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", data_dir: str = "data"):
-        self.encoder = EmbeddingModel(model_name)
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", data_dir: str = "data", device: str | None = None):
+        self.encoder = EmbeddingModel(model_name, device=device)
         self.store = VectorStore()
         self.data_dir = data_dir
 
@@ -145,11 +145,14 @@ async def main():
     args = parser.parse_args()
 
     model_name = args.model
+    device = None
     if model_name is None:
         cfg_path = "config.json"
         if os.path.exists(cfg_path):
             with open(cfg_path) as f:
-                model_name = json.load(f).get("model_name", "all-MiniLM-L6-v2")
+                cfg = json.load(f)
+                model_name = cfg.get("model_name", "all-MiniLM-L6-v2")
+                device = cfg.get("device")
         else:
             model_name = "all-MiniLM-L6-v2"
 
@@ -160,7 +163,7 @@ async def main():
     else:
         data_dir = "data"
 
-    app = EmbedderApp(model_name, data_dir=data_dir)
+    app = EmbedderApp(model_name, data_dir=data_dir, device=device)
 
     data_path = args.data or os.path.join(data_dir, "enriched_vectors.npz")
     if os.path.exists(data_path):

@@ -72,6 +72,8 @@ search() ← flat search     TreeIndex (tree_vectors.npz)
 
 Default: `paraphrase-multilingual-MiniLM-L12-v2` (384-dim, 50+ languages). Override in `config.json`.
 
+Device: `"cpu"` (default) or `"cuda"`. Set `"device": "cuda"` in `config.json` to use GPU. Remove the line for auto-detect.
+
 Any sentence-transformers model works. Popular alternatives:
 - `all-MiniLM-L6-v2` — fastest, 384-dim, English-optimized
 - `all-mpnet-base-v2` — higher quality, 768-dim, slower
