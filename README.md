@@ -68,9 +68,25 @@ search() ← flat search     TreeIndex (tree_vectors.npz)
                            tree_search() ← context (parent/children/siblings)
 ```
 
-## Model
+## Model (embedding)
 
 Default: `paraphrase-multilingual-MiniLM-L12-v2` (384-dim, 50+ languages). Override in `config.json`.
+
+Any sentence-transformers model works. Popular alternatives:
+- `all-MiniLM-L6-v2` — fastest, 384-dim, English-optimized
+- `all-mpnet-base-v2` — higher quality, 768-dim, slower
+- `intfloat/multilingual-e5-small` — good multilingual, 384-dim
+
+## Enrichment strategies
+
+Configured in `config.json` under `"enrichment"` key (array of strategy names):
+- `kind` — node type (class/function/method)
+- `name` — symbol name
+- `signature` — arguments and return type
+- `docstring` — doc comments
+- `body` — method body summary (first N lines)
+
+Order matters: `["kind", "name", "signature", "docstring"]` produces e.g. `[CLASS] UserService | find(id) | Finds user by id`.
 
 ## Configuration (`config.json`)
 
