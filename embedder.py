@@ -300,18 +300,19 @@ class ASTParser:
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
                     doc = ast.get_docstring(node) or ""
-                    methods = [n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-                    chunks.append(
-                        f"[CLASS] {node.name} ({path_hint}): {doc} | methods: {', '.join(methods)}"
-                    )
+                    chunk = f"{path_hint} class_definition {node.name}"
+                    if doc:
+                        chunk += f" | {doc}"
+                    chunks.append(chunk)
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if hasattr(node, 'parent') and isinstance(node.parent, ast.ClassDef):
                         continue
                     doc = ast.get_docstring(node) or ""
                     args = [a.arg for a in node.args.args]
-                    chunks.append(
-                        f"[FUNC] {node.name}({', '.join(args)}) ({path_hint}): {doc}"
-                    )
+                    chunk = f"{path_hint} function_definition {node.name}({', '.join(args)})"
+                    if doc:
+                        chunk += f" | {doc}"
+                    chunks.append(chunk)
         except SyntaxError as e:
             chunks.append(f"[FILE] {path_hint} (parse error: {e})")
         return chunks if chunks else cls._parse_fallback(source, path_hint)
@@ -369,13 +370,13 @@ class ASTParser:
                     if name:
                         params = node.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
-                        prefix = f"[{node.type.upper()}]"
-                        entry = f"{prefix} {name} ({path_hint})"
+                        # Build text in the same format as tree parser
+                        text = f"{path_hint} {node.type} {name}"
                         if sig_text:
-                            entry += f" {sig_text}"
+                            text += f" ({sig_text})"
                         if doc:
-                            entry += f": {doc.strip()}"
-                        chunks.append(entry)
+                            text += f" | {doc.strip()}"
+                        chunks.append(text)
                 for c in node.children:
                     walk(c)
             walk(root)
@@ -389,6 +390,13 @@ class ASTParser:
             return cls._parse_fallback(source, path_hint)
         try:
             import clang.cindex as ci
+            # Try to set the library path to common locations
+            for libpath in ['/usr/lib/llvm-18/lib', '/usr/lib/llvm-15/lib', '/usr/lib/x86_64-linux-gnu']:
+                try:
+                    ci.Config.set_library_path(libpath)
+                    break
+                except:
+                    pass
             index = ci.Index.create()
             # Parse the source as an unsaved file
             unsaved_file = (path_hint, source)
@@ -427,13 +435,13 @@ class ASTParser:
                             signature = f"({', '.join(arg_types)})"
                         except Exception:
                             signature = ""
-                    # Build entry
-                    entry = f"[{cursor.kind.name}] {name} ({path_hint})"
+                    # Build text in the same format as tree parser
+                    text = f"{path_hint} {cursor.kind.name.lower().replace('_decl', '')} {name}"
                     if signature:
-                        entry += f" {signature}"
+                        text += f" ({signature})"
                     if doc:
-                        entry += f": {doc}"
-                    chunks.append(entry)
+                        text += f" | {doc}"
+                    chunks.append(text)
                 # Recurse
                 for child in cursor.get_children():
                     walk(child)
@@ -475,13 +483,13 @@ class ASTParser:
                     if name:
                         params = node.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
-                        prefix = f"[{node.type.upper()}]"
-                        entry = f"{prefix} {name} ({path_hint})"
+                        # Build text in the same format as tree parser
+                        text = f"{path_hint} {node.type} {name}"
                         if sig_text:
-                            entry += f" {sig_text}"
+                            text += f" ({sig_text})"
                         if doc:
-                            entry += f": {doc.strip()}"
-                        chunks.append(entry)
+                            text += f" | {doc}"
+                        chunks.append(text)
                 for c in node.children:
                     walk(c)
             walk(root)
