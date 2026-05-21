@@ -1,0 +1,97 @@
+{
+  "nodes": [
+    {
+      "id": 0,
+      "parent_id": -1,
+      "type": "function_definition",
+      "name": "get_name",
+      "file": "./tree_ast_parser.py",
+      "start_line": 28,
+      "end_line": 32,
+      "signature": "(node)",
+      "docstring": "",
+      "text": "./tree_ast_parser.py function_definition get_name ((node))"
+    },
+    {
+      "id": 1,
+      "parent_id": -1,
+      "type": "function_definition",
+      "name": "get_docstring",
+      "file": "./tree_ast_parser.py",
+      "start_line": 35,
+      "end_line": 52,
+      "signature": "(node, source: bytes)",
+      "docstring": "",
+      "text": "./tree_ast_parser.py function_definition get_docstring ((node, source: bytes))"
+    },
+    {
+      "id": 2,
+      "parent_id": -1,
+      "type": "function_definition",
+      "name": "get_signature",
+      "file": "./tree_ast_parser.py",
+      "start_line": 55,
+      "end_line": 63,
+      "signature": "(node, source: bytes, lang: str)",
+      "docstring": "",
+      "text": "./tree_ast_parser.py function_definition get_signature ((node, source: bytes, lang: str))"
+    },
+    {
+      "id": 3,
+      "parent_id": -1,
+      "type": "function_definition",
+      "name": "collect_nodes",
+      "file": "./tree_ast_parser.py",
+      "start_line": 66,
+      "end_line": 98,
+      "signature": "(node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None)",
+      "docstring": "",
+      "text": "./tree_ast_parser.py function_definition collect_nodes ((node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None))"
+    },
+    {
+      "id": 4,
+      "parent_id": -1,
+      "type": "function_definition",
+      "name": "parse_file",
+      "file": "./tree_ast_parser.py",
+      "start_line": 101,
+      "end_line": 114,
+      "signature": "(filepath: str, next_id: list | None = None)",
+      "docstring": "",
+      "text": "./tree_ast_parser.py function_definition parse_file ((filepath: str, next_id: list | None = None))"
+    },
+    {
+      "id": 5,
+      "parent_id": -1,
+      "type": "function_definition",
+      "name": "build_index",
+      "file": "./tree_ast_parser.py",
+      "start_line": 117,
+      "end_line": 152,
+      "signature": "(root=\".\", data_dir=\"data\", exclude={\"/venv/\", \"/__pycache__/\", \"/.\", \"/node_modules/\", \"/.git/\"})",
+      "docstring": "",
+      "text": "./tree_ast_parser.py function_definition build_index ((root=\".\", data_dir=\"data\", exclude={\"/venv/\", \"/__pycache__/\", \"/.\", \"/node_modules/\", \"/.git/\"}))"
+    },
+    {
+      "id": 6,
+      "parent_id": -1,
+      "type": "function_definition",
+      "name": "build_delta",
+      "file": "./tree_ast_parser.py",
+      "start_line": 155,
+      "end_line": 197,
+      "signature": "(root=\".\", data_dir=\"data\", exclude={\"/venv/\", \"/__pycache__/\", \"/.\", \"/node_modules/\", \"/.git/\"})",
+      "docstring": "",
+      "text": "./tree_ast_parser.py function_definition build_delta ((root=\".\", data_dir=\"data\", exclude={\"/venv/\", \"/__pycache__/\", \"/.\", \"/node_modules/\", \"/.git/\"}))"
+    }
+  ],
+  "texts": [
+    "./tree_ast_parser.py function_definition get_name ((node))",
+    "./tree_ast_parser.py function_definition get_docstring ((node, source: bytes))",
+    "./tree_ast_parser.py function_definition get_signature ((node, source: bytes, lang: str))",
+    "./tree_ast_parser.py function_definition collect_nodes ((node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None))",
+    "./tree_ast_parser.py function_definition parse_file ((filepath: str, next_id: list | None = None))",
+    "./tree_ast_parser.py function_definition build_index ((root=\".\", data_dir=\"data\", exclude={\"/venv/\", \"/__pycache__/\", \"/.\", \"/node_modules/\", \"/.git/\"}))",
+    "./tree_ast_parser.py function_definition build_delta ((root=\".\", data_dir=\"data\", exclude={\"/venv/\", \"/__pycache__/\", \"/.\", \"/node_modules/\", \"/.git/\"}))"
+  ]
+}
