@@ -124,9 +124,10 @@ def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "
     files = [f for f in files if os.path.isfile(f) and f.endswith(exts)]
     files = [f for f in files if not any(x in f for x in exclude)]
 
+    next_id = [0]
     for fp in sorted(files):
         try:
-            nodes = parse_file(fp)
+            nodes = parse_file(fp, next_id=next_id)
         except Exception as e:
             print(f"  SKIP {fp}: {e}")
             continue
@@ -143,10 +144,7 @@ def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "
     json_path = os.path.join(data_dir, "tree_index.json")
     StorageIO.save(vec_path, store.vectors, store.texts, model.dim)
 
-    tree_data = {
-        "nodes": all_nodes,
-        "texts": store.texts,
-    }
+    tree_data = {"nodes": all_nodes, "texts": store.texts}
     with open(json_path, "w", encoding="utf8") as f:
         json.dump(tree_data, f, ensure_ascii=False, indent=2)
 
@@ -154,10 +152,59 @@ def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "
     return model, store, all_nodes
 
 
+def build_delta(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}):
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"],
+        capture_output=True, text=True, cwd=root
+    ).stdout.strip().splitlines()
+    changed = [os.path.join(root, f) for f in changed if f]
+    if not changed:
+        print("No changed files")
+        return
+
+    exts = tuple(LANGUAGES.keys())
+    changed = [f for f in changed if os.path.isfile(f) and f.endswith(exts)]
+    changed = [f for f in changed if not any(x in f for x in exclude)]
+
+    model = EmbeddingModel()
+    store = VectorStore()
+    all_nodes = []
+    next_id = [0]
+
+    for fp in sorted(changed):
+        try:
+            nodes = parse_file(fp, next_id=next_id)
+        except Exception as e:
+            print(f"  SKIP {fp}: {e}")
+            continue
+        if not nodes:
+            continue
+        texts = [n["text"] for n in nodes]
+        vecs = model.embed_many(texts)
+        store.add_many(vecs, texts)
+        all_nodes.extend(nodes)
+        print(f"  {fp}: {len(nodes)} nodes")
+
+    os.makedirs(data_dir, exist_ok=True)
+    vec_path = os.path.join(data_dir, "delta_tree_vectors.npz")
+    json_path = os.path.join(data_dir, "delta_tree_index.json")
+    StorageIO.save(vec_path, store.vectors, store.texts, model.dim)
+
+    tree_data = {"nodes": all_nodes, "texts": store.texts}
+    with open(json_path, "w", encoding="utf8") as f:
+        json.dump(tree_data, f, ensure_ascii=False, indent=2)
+
+    print(f"\nSaved {len(all_nodes)} delta nodes to {vec_path} + {json_path}")
+
+
 if __name__ == "__main__":
-    import argparse
+    import argparse, subprocess
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
     parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--delta", action="store_true", help="parse only files changed in HEAD")
     args = parser.parse_args()
-    build_index(root=args.root, data_dir=args.data_dir)
+    if args.delta:
+        build_delta(root=args.root, data_dir=args.data_dir)
+    else:
+        build_index(root=args.root, data_dir=args.data_dir)
