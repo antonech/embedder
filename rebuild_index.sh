@@ -11,6 +11,7 @@
 set -e
 PROJECT="${1:-.}"
 PROJECT="$(cd "$PROJECT" && pwd)"
+export PROJECT
 ME="$(cd "$(dirname "$0")" && pwd)"
 
 cd "$ME"
