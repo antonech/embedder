@@ -14,17 +14,14 @@ System deps: `libclang-18-dev` (for C++ parsing).
 
 ## Usage
 
-### Rebuild flat index
+### Rebuild indices
 ```bash
 ./rebuild_index.sh /path/to/project
 ```
-Scans project, parses AST (Python, C++, JavaScript, TypeScript, Go, Rust), embeds with sentence-transformers, saves to `data/enriched_vectors.npz`.
-
-### Rebuild tree index (AST context)
-```bash
-python tree_ast_parser.py --root /path/to/project --data-dir /path/to/project/data
-```
-Builds `tree_vectors.npz` + `tree_index.json` with hierarchical AST nodes (parent/children/siblings).
+Scans project, parses AST (Python, C++, JavaScript, TypeScript, Go, Rust), embeds with sentence-transformers.
+Builds both:
+- `data/enriched_vectors.npz` — flat AST search
+- `data/tree_vectors.npz` + `data/tree_index.json` — hierarchical AST context (parent/children/siblings)
 
 ### MCP server (OpenCode integration)
 ```bash

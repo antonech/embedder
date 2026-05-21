@@ -1,11 +1,15 @@
 ---
 name: rebuild-index
-description: Rebuild the enriched vector index from Python source files. Parses AST, enriches with class/function signatures and docstrings, embeds with all-MiniLM-L6-v2, saves to data/enriched_vectors.npz.
+description: Rebuild enriched vector index and tree-sitter AST index from source files. Parses AST, enriches with signatures and docstrings, embeds with sentence-transformers, saves both flat and hierarchical indices.
 ---
 
 # Rebuild Vector Index
 
-Parses `.py`, `.js`, `.ts`, `.go`, `.rs`, `.cpp` and more — extracts classes, functions, methods via AST enrichment (kind + name + signature + docstring), embeds with sentence-transformers, saves to `data/enriched_vectors.npz`.
+Parses `.py`, `.js`, `.ts`, `.go`, `.rs`, `.cpp` and more — extracts classes, functions, methods via AST enrichment (kind + name + signature + docstring), embeds with sentence-transformers.
+
+Builds both indices in one run:
+- `data/enriched_vectors.npz` — flat AST search
+- `data/tree_vectors.npz` + `data/tree_index.json` — hierarchical AST context (parent/children/siblings)
 
 Accepts any project directory — pass the path as argument.
 
