@@ -153,9 +153,9 @@ def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "
         all_nodes.extend(nodes)
         print(f"  {fp}: {len(nodes)} nodes")
 
-    os.makedirs(data_dir, exist_ok=True)
-    vec_path = os.path.join(data_dir, "tree_vectors.npz")
-    json_path = os.path.join(data_dir, "tree_index.json")
+    os.makedirs(data_dir or "data", exist_ok=True)
+    vec_path = os.path.join(data_dir or "data", "tree_vectors.npz")
+    json_path = os.path.join(data_dir or "data", "tree_index.json")
     StorageIO.save(vec_path, store.vectors, store.texts, model.dim)
 
     tree_data = {"nodes": all_nodes, "texts": store.texts}
