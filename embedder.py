@@ -1,4 +1,4 @@
-import os, json, ast, re as _re
+import os, json, ast, re as _re, subprocess, argparse, sys
 
 import numpy as np
 from typing import Optional
@@ -577,3 +577,104 @@ class StorageIO:
         texts = list(data["texts"])
         dim = int(data["dim"])
         return vectors, texts, dim
+
+
+def build_flat_index(root: str, data_dir: str = "data", delta: bool = False) -> None:
+    """Build flat vector index for a project.
+
+    Args:
+        root: Project root directory.
+        data_dir: Directory to save the index (relative to root).
+        delta: If True, build delta index (only changed files).
+    """
+    # Load configuration
+    cfg_path = os.path.join(root, "config.json")
+    model_name = "all-MiniLM-L6-v2"
+    device = None
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        model_name = cfg.get("model_name", model_name)
+        device = cfg.get("device")
+
+    # Initialize model and store
+    enc = EmbeddingModel(model_name, device=device)
+    store = VectorStore()
+
+    project = root
+    if delta:
+        # --- Delta mode: only changed files ---
+        os.chdir(project)
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            capture_output=True, text=True, timeout=30
+        )
+        changed = [f.strip() for f in result.stdout.split('\n') if f.strip()]
+        if not changed:
+            print("Delta: no changed files")
+            StorageIO.save(f'{project}/data/delta.npz', [], [], enc.dim)
+            with open(f'{project}/data/delta_texts.json', 'w') as f:
+                json.dump({"files": [], "texts": [], "model": model_name}, f)
+            return
+
+        print(f"Delta: {len(changed)} changed files")
+        chunks = []
+        for fp in changed:
+            abspath = os.path.join(project, fp)
+            if not os.path.isfile(abspath):
+                continue
+            try:
+                file_chunks = ASTParser.parse_file(abspath, path_hint=fp)
+                if file_chunks:
+                    chunks.append(f"[FILE] {fp}")
+                    chunks.extend(file_chunks)
+            except Exception as e:
+                chunks.append(f"[FILE] {fp} (read error: {e})")
+
+        if not chunks:
+            print("Delta: no parseable chunks")
+            StorageIO.save(f'{project}/data/delta.npz', [], [], enc.dim)
+            with open(f'{project}/data/delta_texts.json', 'w') as f:
+                json.dump({"files": changed, "texts": [], "model": model_name}, f)
+            return
+
+        vecs = enc.embed_many(chunks)
+        store.add_many(vecs, chunks)
+
+        out_vec = f'{project}/data/delta.npz'
+        os.makedirs(os.path.dirname(out_vec), exist_ok=True)
+        StorageIO.save(out_vec, store.vectors, store.texts, enc.dim)
+
+        delta_data = {
+            "files": changed,
+            "texts": chunks,
+            "model": model_name,
+        }
+        with open(f'{project}/data/delta_texts.json', 'w') as f:
+            json.dump(delta_data, f, ensure_ascii=False)
+
+        print(f"Delta index: {len(chunks)} chunks from {len(changed)} files -> {out_vec}")
+    else:
+        # --- Full rebuild ---
+        chunks = ASTParser.scan_project(project)
+        vecs = enc.embed_many(chunks)
+        store.add_many(vecs, chunks)
+
+        out = f'{project}/data/enriched_vectors.npz'
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        StorageIO.save(out, store.vectors, store.texts, enc.dim)
+        print(f"Flat index: {len(chunks)} chunks -> {out}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Build flat vector index for a project.')
+    parser.add_argument('--build-flat', action='store_true', help='Build the flat index')
+    parser.add_argument('--delta', action='store_true', help='Build delta index (only changed files)')
+    parser.add_argument('--data-dir', default='data', help='Directory to save the index')
+    parser.add_argument('--root', default='.', help='Project root directory')
+    args = parser.parse_args()
+
+    if args.build_flat:
+        build_flat_index(args.root, args.data_dir, args.delta)
+    else:
+        parser.error('Please specify --build-flat')
