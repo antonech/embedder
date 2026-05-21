@@ -4,3 +4,4 @@ __pycache__/
 install_torch.log
 install.log
 data/*.npz
+data/tree_index.json
