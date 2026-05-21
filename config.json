@@ -3,5 +3,6 @@
     "model_name": "paraphrase-multilingual-MiniLM-L12-v2",
     "device": "cpu",
     "top_k": 5,
-    "enrichment": ["kind", "name", "signature", "docstring"]
+    "enrichment": ["kind", "name", "signature", "docstring"],
+    "use_clang": true
 }
