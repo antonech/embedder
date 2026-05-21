@@ -23,6 +23,36 @@ _TS_LANGUAGES = {
     ".rs":  ("rust", tree_sitter_rust.language),
 } if _TS_AVAILABLE else {}
 
+    # --- Clang support (optional) ---
+_CLANG_AVAILABLE = False
+_USE_CLANG = False  # can be enabled via config.json
+try:
+    import clang.cindex as ci
+    # Try to set the library path to common locations
+    for libpath in ['/usr/lib/llvm-18/lib', '/usr/lib/llvm-15/lib', '/usr/lib/x86_64-linux-gnu']:
+        try:
+            ci.Config.set_library_path(libpath)
+            break
+        except:
+            pass
+    _CLANG_AVAILABLE = True
+    # Define significant cursor kinds for clang (if available)
+    _CLANG_SIGNIFICANT = {
+        ci.CursorKind.CLASS_DECL,
+        ci.CursorKind.STRUCT_DECL,
+        ci.CursorKind.UNION_DECL,
+        ci.CursorKind.CXX_METHOD,
+        ci.CursorKind.CONSTRUCTOR,
+        ci.CursorKind.FUNCTION_DECL,
+        ci.CursorKind.FUNCTION_TEMPLATE,
+        ci.CursorKind.ENUM_DECL,
+        ci.CursorKind.TYPEDEF_DECL,
+        ci.CursorKind.TYPE_ALIAS_DECL,
+    }
+except Exception:
+    _CLANG_AVAILABLE = False
+    _CLANG_SIGNIFICANT = set()
+
 _TS_SIGNIFICANT = {
     "javascript": {
         "class_declaration", "function_declaration",
@@ -156,6 +186,22 @@ class ASTParser:
     SKIP_DIRS = {'venv', '.git', '__pycache__', 'node_modules'}
 
     _handlers: dict[str, callable] = {}
+    _use_clang = False  # class variable, set by scan_project from config
+
+    # --- Clang significant cursor kinds (if clang available) ---
+    if _CLANG_AVAILABLE:
+        _CLANG_SIGNIFICANT = {
+            ci.CursorKind.CLASS_DECL,
+            ci.CursorKind.STRUCT_DECL,
+            ci.CursorKind.UNION_DECL,
+            ci.CursorKind.FUNCTION_DECL,
+            ci.CursorKind.ENUM_DECL,
+            ci.CursorKind.TYPEDEF_DECL,
+            ci.CursorKind.TYPE_ALIAS_DECL,
+        }
+    else:
+        _CLANG_SIGNIFICANT = set()
+    _use_clang = False  # class variable, set by scan_project from config
 
     @classmethod
     def register(cls, glob_pattern: str, handler: callable):
@@ -189,6 +235,19 @@ class ASTParser:
                 with open(cfg_path) as f:
                     cfg = json.load(f)
                 enrichment_keys = cfg.get("enrichment")
+                # Set the use_clang flag from config
+                cls._use_clang = cfg.get("use_clang", False)
+            else:
+                cls._use_clang = False
+        else:
+            # If enrichment_keys is provided, we still set the flag from config if available
+            cfg_path = os.path.join(root, "config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                cls._use_clang = cfg.get("use_clang", False)
+            else:
+                cls._use_clang = False
         return CompositeStrategy.from_keys(enrichment_keys or ["kind", "name", "signature", "docstring"])
 
     @classmethod
@@ -233,8 +292,8 @@ class ASTParser:
             return super().visit(node)
 
     @classmethod
-    def _parse_python(cls, source: str, path_hint: str = "") -> list[dict | str]:
-        chunks: list[dict | str] = []
+    def _parse_python(cls, source: str, path_hint: str = "") -> list[str]:
+        chunks: list[str] = []
         try:
             tree = ast.parse(source)
             cls._ParentVisitor().visit(tree)
@@ -242,96 +301,20 @@ class ASTParser:
                 if isinstance(node, ast.ClassDef):
                     doc = ast.get_docstring(node) or ""
                     methods = [n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-                    chunks.append({
-                        "kind": "class",
-                        "name": node.name,
-                        "args": [],
-                        "returns": "",
-                        "docstring": doc,
-                        "methods": methods,
-                        "file": path_hint,
-                    })
+                    chunks.append(
+                        f"[CLASS] {node.name} ({path_hint}): {doc} | methods: {', '.join(methods)}"
+                    )
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if hasattr(node, 'parent') and isinstance(node.parent, ast.ClassDef):
                         continue
                     doc = ast.get_docstring(node) or ""
-                    chunks.append({
-                        "kind": "function",
-                        "name": node.name,
-                        "args": [{"name": a.arg} for a in node.args.args],
-                        "returns": "",
-                        "docstring": doc,
-                        "file": path_hint,
-                    })
+                    args = [a.arg for a in node.args.args]
+                    chunks.append(
+                        f"[FUNC] {node.name}({', '.join(args)}) ({path_hint}): {doc}"
+                    )
         except SyntaxError as e:
             chunks.append(f"[FILE] {path_hint} (parse error: {e})")
-        return chunks
-
-    # --- C/C++ handler (libclang AST) ---
-
-    _CLANG_SET = False
-
-    @classmethod
-    def _init_clang(cls):
-        if cls._CLANG_SET:
-            return
-        try:
-            import clang.cindex as ci
-            ci.Config.set_library_file('/usr/lib/llvm-18/lib/libclang.so.1')
-            cls._ci = ci
-            cls._CLANG_SET = True
-        except Exception:
-            cls._CLANG_SET = False
-
-    @classmethod
-    def _parse_cpp(cls, source: str, path_hint: str = "") -> list[dict | str]:
-        cls._init_clang()
-        if not cls._CLANG_SET:
-            return cls._parse_fallback(source, path_hint)
-
-        ci = cls._ci
-        chunks: list[dict | str] = []
-        try:
-            tu = ci.Index.create().parse(
-                path_hint or 'file.cpp',
-                unsaved_files=[(path_hint or 'file.cpp', source.encode())],
-            )
-            for n in tu.cursor.walk_preorder():
-                if n.kind == ci.CursorKind.CLASS_DECL:
-                    doc = cls._clang_doc(n)
-                    chunks.append({
-                        "kind": "class",
-                        "name": n.spelling,
-                        "args": [],
-                        "returns": "",
-                        "docstring": doc,
-                        "file": path_hint,
-                    })
-                elif n.kind in (ci.CursorKind.CXX_METHOD, ci.CursorKind.FUNCTION_DECL):
-                    if n.kind == ci.CursorKind.CXX_METHOD and n.semantic_parent.entity_kind == ci.CursorKind.CLASS_DECL:
-                        continue
-                    doc = cls._clang_doc(n)
-                    chunks.append({
-                        "kind": "function",
-                        "name": n.spelling,
-                        "args": [{"name": p.spelling} for p in n.get_arguments()],
-                        "returns": n.result_type.spelling if n.result_type else '',
-                        "docstring": doc,
-                        "file": path_hint,
-                    })
-        except Exception as e:
-            chunks.append(f"[FILE] {path_hint} (clang error: {e})")
-        return chunks
-
-    @classmethod
-    def _clang_doc(cls, cursor) -> str:
-        try:
-            doc = cursor.brief_comment
-            if not doc:
-                doc = cursor.raw_comment
-            return (doc or '').strip()
-        except Exception:
-            return ""
+        return chunks if chunks else cls._parse_fallback(source, path_hint)
 
     # --- Fallback: line-based chunking ---
 
@@ -344,11 +327,125 @@ class ASTParser:
                 chunks.append(f"[LINE] {stripped[:120]}")
         return chunks
 
+    # --- C/C++ handler (tree-sitter) ---
+
+    _CPP_SIGNIFICANT = {
+        "class_specifier", "struct_specifier",
+        "function_definition", "template_function",
+        "template_method", "enum_specifier",
+        "alias_declaration",
+    }
+
+    @classmethod
+    def _parse_cpp(cls, source: str, path_hint: str = "") -> list[str]:
+        # Use clang if enabled and available
+        if cls._use_clang and _CLANG_AVAILABLE:
+            return cls._parse_cpp_clang(source, path_hint)
+        # Otherwise use tree-sitter
+        if not _TS_AVAILABLE:
+            return cls._parse_fallback(source, path_hint)
+        try:
+            from tree_sitter import Language, Parser
+            import tree_sitter_cpp
+            lang = Language(tree_sitter_cpp.language())
+        except Exception:
+            return cls._parse_fallback(source, path_hint)
+
+        chunks: list[str] = []
+        try:
+            parser = Parser(lang)
+            tree = parser.parse(source.encode("utf8", errors="ignore"))
+            root = tree.root_node
+
+            def walk(node):
+                if node.type in cls._CPP_SIGNIFICANT:
+                    name_node = node.child_by_field_name("name")
+                    name = name_node.text.decode("utf8", errors="ignore") if name_node else ""
+                    doc = ""
+                    for c in node.children:
+                        if c.type == "comment":
+                            doc = c.text.decode("utf8", errors="ignore")
+                            break
+                    if name:
+                        params = node.child_by_field_name("parameters")
+                        sig_text = params.text.decode("utf8", errors="ignore") if params else ""
+                        prefix = f"[{node.type.upper()}]"
+                        entry = f"{prefix} {name} ({path_hint})"
+                        if sig_text:
+                            entry += f" {sig_text}"
+                        if doc:
+                            entry += f": {doc.strip()}"
+                        chunks.append(entry)
+                for c in node.children:
+                    walk(c)
+            walk(root)
+        except Exception as e:
+            chunks.append(f"[FILE] {path_hint} (parse error: {e})")
+        return chunks if chunks else cls._parse_fallback(source, path_hint)
+
+    @classmethod
+    def _parse_cpp_clang(cls, source: str, path_hint: str = "") -> list[str]:
+        if not _CLANG_AVAILABLE:
+            return cls._parse_fallback(source, path_hint)
+        try:
+            import clang.cindex as ci
+            index = ci.Index.create()
+            # Parse the source as an unsaved file
+            unsaved_file = (path_hint, source)
+            tu = index.parse(path_hint, unsaved_files=[unsaved_file], args=['-x', 'c++', '-std=c++17'])
+            if tu.diagnostics:
+                for diag in tu.diagnostics:
+                    if diag.severity >= ci.Diagnostic.Error:
+                        return cls._parse_fallback(source, path_hint)
+        except Exception:
+            return cls._parse_fallback(source, path_hint)
+
+        chunks: list[str] = []
+        try:
+            def walk(cursor):
+                if cursor.kind in ASTParser._CLANG_SIGNIFICANT:
+                    name = cursor.spelling
+                    # Get comment: try to get raw comment
+                    doc = cursor.raw_comment if hasattr(cursor, 'raw_comment') else ""
+                    # Clean up comment delimiters if present
+                    if doc:
+                        # Remove common comment delimiters: /* ... */ or // ...
+                        # Simple stripping: remove leading/trailing whitespace and common markers
+                        doc = doc.strip()
+                        if doc.startswith('/*') and doc.endswith('*/'):
+                            doc = doc[2:-2].strip()
+                        elif doc.startswith('//'):
+                            doc = doc[2:].strip()
+                    # Get signature for functions: parameter types only
+                    signature = ""
+                    if cursor.kind == ci.CursorKind.FUNCTION_DECL:
+                        try:
+                            func_type = cursor.type
+                            arg_types = []
+                            for arg_type in func_type.argument_types():
+                                arg_types.append(arg_type.spelling)
+                            signature = f"({', '.join(arg_types)})"
+                        except Exception:
+                            signature = ""
+                    # Build entry
+                    entry = f"[{cursor.kind.name}] {name} ({path_hint})"
+                    if signature:
+                        entry += f" {signature}"
+                    if doc:
+                        entry += f": {doc}"
+                    chunks.append(entry)
+                # Recurse
+                for child in cursor.get_children():
+                    walk(child)
+            walk(tu.cursor)
+        except Exception as e:
+            chunks.append(f"[FILE] {path_hint} (clang parse error: {e})")
+        return chunks if chunks else cls._parse_fallback(source, path_hint)
 
     # --- Tree-sitter based handler (JS / Go / Rust) ---
 
     @classmethod
-    def _parse_treesitter(cls, source: str, path_hint: str = "") -> list[dict | str]:
+    def _parse_treesitter(cls, source: str, path_hint: str = "") -> list[str]:
         if not _TS_AVAILABLE:
             return cls._parse_fallback(source, path_hint)
 
@@ -360,43 +457,36 @@ class ASTParser:
         lang_name, lang_fn = lang_config
         significant = _TS_SIGNIFICANT.get(lang_name, set())
 
-        chunks: list[dict | str] = []
+        chunks: list[str] = []
         try:
             parser = Parser(Language(lang_fn()))
             tree = parser.parse(source.encode("utf8", errors="ignore"))
             root = tree.root_node
 
-            def walk(node, parent_name=""):
+            def walk(node):
                 if node.type in significant:
                     name_node = node.child_by_field_name("name")
                     name = name_node.text.decode("utf8", errors="ignore") if name_node else ""
-
                     doc = ""
                     for c in node.children:
                         if c.type == "comment":
                             doc = c.text.decode("utf8", errors="ignore")
                             break
-
                     if name:
                         params = node.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
-                        chunks.append({
-                            "kind": node.type,
-                            "name": name,
-                            "args": [{"name": p.strip()} for p in sig_text.strip("()").split(",")] if sig_text else [],
-                            "returns": "",
-                            "docstring": doc.strip(),
-                            "file": path_hint,
-                        })
-
+                        prefix = f"[{node.type.upper()}]"
+                        entry = f"{prefix} {name} ({path_hint})"
+                        if sig_text:
+                            entry += f" {sig_text}"
+                        if doc:
+                            entry += f": {doc.strip()}"
+                        chunks.append(entry)
                 for c in node.children:
-                    walk(c, name if node.type in significant else parent_name)
-
+                    walk(c)
             walk(root)
-
         except Exception as e:
             chunks.append(f"[FILE] {path_hint} (parse error: {e})")
-
         return chunks if chunks else cls._parse_fallback(source, path_hint)
 
 

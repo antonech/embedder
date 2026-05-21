@@ -21,7 +21,9 @@ SIGNIFICANT_TYPES = {
     "class_definition", "function_definition",
     "method_signature", "function_signature",
     "struct_specifier", "class_specifier",
-    "function_definition", "declaration",
+    "template_function", "template_method",
+    "enum_specifier", "alias_declaration",
+    "declaration",
 }
 
 
@@ -63,7 +65,9 @@ def get_signature(node, source: bytes, lang: str) -> str:
     return ""
 
 
-def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None):
+def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None, root: str = "."):
+    # Compute the relative path from root to filepath
+    rel_filepath = os.path.relpath(filepath, root)
     if next_id is None:
         next_id = [0]
     node_id = next_id[0]
@@ -85,12 +89,12 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
                 "parent_id": parent_id,
                 "type": node.type,
                 "name": name,
-                "file": filepath,
+                "file": rel_filepath,
                 "start_line": node.start_point[0] + 1,
                 "end_line": node.end_point[0] + 1,
                 "signature": sig,
                 "docstring": doc,
-                "text": enriched,
+                "text": f"{rel_filepath} {node.type} {name}" + (f" ({sig})" if sig else "") + (f" | {doc}" if doc else ""),
             })
             parent_id = node_id
 
@@ -98,7 +102,7 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
         collect_nodes(child, source, filepath, lang, nodes, parent_id, next_id)
 
 
-def parse_file(filepath: str, next_id: list | None = None) -> list[dict]:
+def parse_file(filepath: str, next_id: list | None = None, root: str = ".") -> list[dict]:
     ext = os.path.splitext(filepath)[1].lower()
     lang_obj = LANGUAGES.get(ext)
     if not lang_obj:
@@ -110,7 +114,7 @@ def parse_file(filepath: str, next_id: list | None = None) -> list[dict]:
     parser = Parser(lang_obj)
     tree = parser.parse(source)
     nodes = []
-    collect_nodes(tree.root_node, source, filepath, ext, nodes, next_id=next_id)
+    collect_nodes(tree.root_node, source, filepath, ext, nodes, next_id=next_id, root=root)
     return nodes
 
 
@@ -127,7 +131,7 @@ def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "
     next_id = [0]
     for fp in sorted(files):
         try:
-            nodes = parse_file(fp, next_id=next_id)
+            nodes = parse_file(fp, next_id=next_id, root=root)
         except Exception as e:
             print(f"  SKIP {fp}: {e}")
             continue

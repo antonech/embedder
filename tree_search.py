@@ -60,17 +60,55 @@ class TreeIndex:
                 if cid in self.nodes and cid != node_id]
 
     def _match_node(self, text: str) -> dict | None:
-        import re
-        m = re.search(r'\(([^)]+)\)\s*$', text)
-        if not m:
-            return None
-        file = m.group(1)
-        parts = [p.strip() for p in text.split('|')]
-        name = parts[1] if len(parts) > 1 else ''
+        # First, try exact match on the stored text (which is the same as the node's text)
         for n in self.nodes.values():
-            nf = n["file"].lstrip("./")
-            if nf == file and n["name"] == name:
+            if n["text"] == text:
                 return n
+        
+        # Fallback to parsing the text to extract file and name
+        import re
+        
+        # Try to match the pattern: "filepath type name (signature) | docstring" or "filepath type name"
+        # First, split by ' | ' to separate the main part from docstring
+        main_part = text.split(' | ')[0].strip()
+        
+        # Now try to extract file, type, name from main_part
+        # The format is: "filepath type name (signature)" or "filepath type name"
+        tokens = main_part.split()
+        if len(tokens) >= 3:
+            # First token is file, second is type, the rest is name (possibly with signature in parentheses)
+            file = tokens[0]
+            # type = tokens[1]  # we don't need type for matching
+            # Reconstruct the name from remaining tokens
+            name_tokens = tokens[2:]
+            name = ' '.join(name_tokens)
+            
+            # Remove trailing signature in parentheses if present
+            if name.endswith(')'):
+                # Find the opening parenthesis that matches the closing one
+                # Simple approach: remove everything from the last ' (' to the end
+                if ' (' in name:
+                    name = name.rsplit(' (', 1)[0]
+            
+            # Look for the node with matching file and name
+            for n in self.nodes.values():
+                nf = n["file"].lstrip("./")
+                if nf == file and n["name"] == name:
+                    return n
+        
+        # If that didn't work, try a more flexible approach: just look for file and name substrings
+        # Extract potential file path (first token that looks like a path)
+        for token in tokens:
+            if '/' in token or '.' in token:  # likely a file path
+                # Try to find a node with this file
+                for n in self.nodes.values():
+                    nf = n["file"].lstrip("./")
+                    if nf == token:
+                        # If we found a file match, try to match the name as well
+                        # For simplicity, if file matches exactly, return it (best we can do)
+                        return n
+                break
+        
         return None
 
     def search_with_context(self, store, query_vec, top_k: int = 5) -> list[dict]:

@@ -121,7 +121,9 @@ else:
     print(f"Flat index: {len(chunks)} chunks -> {out}")
 PYEOF
 
-# --- Tree index via tree-sitter (full rebuild only) ---
+# --- Tree index via tree-sitter ---
 if [ "$DELTA" = false ]; then
     python3 tree_ast_parser.py --root "$PROJECT" --data-dir "$DATA_DIR"
+else
+    python3 tree_ast_parser.py --root "$PROJECT" --data-dir "$DATA_DIR" --delta
 fi
