@@ -1,14 +1,17 @@
+import os
 import json
 import asyncio
 import argparse
 from mcp.server.fastmcp import FastMCP
 from embedder import EmbeddingModel, StorageIO, VectorStore
+from tree_search import TreeIndex
 
 
 class EmbedderApp:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", data_dir: str = "data"):
         self.encoder = EmbeddingModel(model_name)
         self.store = VectorStore()
+        self.data_dir = data_dir
 
     def init(self, data_path: str) -> str:
         vecs, texts, dim = StorageIO.load(data_path)
@@ -46,6 +49,14 @@ class EmbedderApp:
         n = len(self.store)
         sample = self.store.texts[:3] if n > 0 else []
         return json.dumps({"vectors": n, "sample_texts": sample}, ensure_ascii=False)
+
+    def tree_search(self, query: str, top_k: int = 5) -> str:
+        if not self.store.vectors:
+            return json.dumps({"error": "Store not loaded"})
+        if not hasattr(self, "_tree"):
+            self._tree = TreeIndex(data_dir=self.data_dir)
+        qv = self.encoder.embed(query)
+        return json.dumps(self._tree.search_with_context(self.store, qv, top_k), ensure_ascii=False, default=str)
 
 
 app: EmbedderApp | None = None
@@ -116,17 +127,47 @@ def save_store(path: str) -> str:
     return app.save(path)
 
 
+@mcp.tool()
+def tree_search(query: str, top_k: int = 5) -> str:
+    """Search with AST context (children/parent/siblings)."""
+    if app is None:
+        return "Error: server not initialized"
+    return app.tree_search(query, top_k)
+
+
 async def main():
     global app
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="all-MiniLM-L6-v2")
+    parser.add_argument("--model", default=None)
     parser.add_argument("--data", default="")
+    parser.add_argument("--data-dir", default="")
     args = parser.parse_args()
 
-    app = EmbedderApp(args.model)
-    if args.data:
-        app.init(args.data)
+    model_name = args.model
+    if model_name is None:
+        cfg_path = "config.json"
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                model_name = json.load(f).get("model_name", "all-MiniLM-L6-v2")
+        else:
+            model_name = "all-MiniLM-L6-v2"
+
+    if args.data_dir:
+        data_dir = args.data_dir
+    elif args.data:
+        data_dir = os.path.dirname(args.data) or "data"
+    else:
+        data_dir = "data"
+
+    app = EmbedderApp(model_name, data_dir=data_dir)
+
+    data_path = args.data or os.path.join(data_dir, "enriched_vectors.npz")
+    if os.path.exists(data_path):
+        print(f"Loading store from {data_path}...")
+        app.init(data_path)
+    elif args.data:
+        print(f"Data file not found: {data_path}")
 
     await mcp.run_stdio_async()
 

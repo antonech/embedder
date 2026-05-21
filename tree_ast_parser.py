@@ -1,0 +1,163 @@
+import os, json, glob
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+from tree_sitter import Language, Parser
+import tree_sitter_python, tree_sitter_cpp, tree_sitter_bash
+from embedder import EmbeddingModel, VectorStore, StorageIO
+
+
+LANGUAGES = {
+    ".py":  Language(tree_sitter_python.language()),
+    ".cpp": Language(tree_sitter_cpp.language()),
+    ".cxx": Language(tree_sitter_cpp.language()),
+    ".cc":  Language(tree_sitter_cpp.language()),
+    ".h":   Language(tree_sitter_cpp.language()),
+    ".hpp": Language(tree_sitter_cpp.language()),
+    ".sh":  Language(tree_sitter_bash.language()),
+    ".bash": Language(tree_sitter_bash.language()),
+}
+
+SIGNIFICANT_TYPES = {
+    "class_definition", "function_definition",
+    "method_signature", "function_signature",
+    "struct_specifier", "class_specifier",
+    "function_definition", "declaration",
+}
+
+
+def get_name(node) -> str:
+    name_node = node.child_by_field_name("name")
+    if name_node:
+        return name_node.text.decode("utf8", errors="ignore")
+    return ""
+
+
+def get_docstring(node, source: bytes) -> str:
+    children = node.children
+    if not children:
+        return ""
+    first = children[0]
+    if first.type == "comment":
+        return first.text.decode("utf8", errors="ignore")
+    for i, c in enumerate(children):
+        if c.type == "block" and c.children:
+            first_in_block = c.children[0]
+            if first_in_block.type in ("expression_statement", "string"):
+                try:
+                    s = first_in_block.text.decode("utf8", errors="ignore")
+                    if '"""' in s or "'''" in s or s.strip().startswith('"'):
+                        return s.strip()
+                except Exception:
+                    pass
+    return ""
+
+
+def get_signature(node, source: bytes, lang: str) -> str:
+    params = node.child_by_field_name("parameters")
+    if params:
+        return params.text.decode("utf8", errors="ignore")
+    if lang == "cpp":
+        decl = node.child_by_field_name("declarator")
+        if decl:
+            return decl.text.decode("utf8", errors="ignore")
+    return ""
+
+
+def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None):
+    if next_id is None:
+        next_id = [0]
+    node_id = next_id[0]
+
+    if node.type in SIGNIFICANT_TYPES:
+        name = get_name(node)
+        if name:
+            next_id[0] += 1
+            sig = get_signature(node, source, lang)
+            doc = get_docstring(node, source)
+            enriched = f"{filepath} {node.type} {name}"
+            if sig:
+                enriched += f" ({sig})"
+            if doc:
+                enriched += f" | {doc}"
+
+            nodes.append({
+                "id": node_id,
+                "parent_id": parent_id,
+                "type": node.type,
+                "name": name,
+                "file": filepath,
+                "start_line": node.start_point[0] + 1,
+                "end_line": node.end_point[0] + 1,
+                "signature": sig,
+                "docstring": doc,
+                "text": enriched,
+            })
+            parent_id = node_id
+
+    for child in node.children:
+        collect_nodes(child, source, filepath, lang, nodes, parent_id, next_id)
+
+
+def parse_file(filepath: str, next_id: list | None = None) -> list[dict]:
+    ext = os.path.splitext(filepath)[1].lower()
+    lang_obj = LANGUAGES.get(ext)
+    if not lang_obj:
+        return []
+
+    with open(filepath, "rb") as f:
+        source = f.read()
+
+    parser = Parser(lang_obj)
+    tree = parser.parse(source)
+    nodes = []
+    collect_nodes(tree.root_node, source, filepath, ext, nodes, next_id=next_id)
+    return nodes
+
+
+def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}):
+    model = EmbeddingModel()
+    store = VectorStore()
+    all_nodes = []
+
+    exts = tuple(LANGUAGES.keys())
+    files = glob.glob(f"{root}/**/*", recursive=True)
+    files = [f for f in files if os.path.isfile(f) and f.endswith(exts)]
+    files = [f for f in files if not any(x in f for x in exclude)]
+
+    for fp in sorted(files):
+        try:
+            nodes = parse_file(fp)
+        except Exception as e:
+            print(f"  SKIP {fp}: {e}")
+            continue
+        if not nodes:
+            continue
+        texts = [n["text"] for n in nodes]
+        vecs = model.embed_many(texts)
+        store.add_many(vecs, texts)
+        all_nodes.extend(nodes)
+        print(f"  {fp}: {len(nodes)} nodes")
+
+    os.makedirs(data_dir, exist_ok=True)
+    vec_path = os.path.join(data_dir, "tree_vectors.npz")
+    json_path = os.path.join(data_dir, "tree_index.json")
+    StorageIO.save(vec_path, store.vectors, store.texts, model.dim)
+
+    tree_data = {
+        "nodes": all_nodes,
+        "texts": store.texts,
+    }
+    with open(json_path, "w", encoding="utf8") as f:
+        json.dump(tree_data, f, ensure_ascii=False, indent=2)
+
+    print(f"\nSaved {len(all_nodes)} nodes to {vec_path} + {json_path}")
+    return model, store, all_nodes
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--data-dir", default="data")
+    args = parser.parse_args()
+    build_index(root=args.root, data_dir=args.data_dir)
