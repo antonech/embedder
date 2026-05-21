@@ -11,6 +11,10 @@ class TreeIndex:
         if os.path.exists(tree_path):
             self._load(tree_path)
 
+        delta_path = os.path.join(data_dir, "delta_tree_index.json")
+        if os.path.exists(delta_path):
+            self._load(delta_path)
+
     def _load(self, tree_path):
         with open(tree_path) as f:
             data = json.load(f)

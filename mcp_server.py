@@ -18,7 +18,25 @@ class EmbedderApp:
         self.store = VectorStore()
         self.store.vectors = vecs
         self.store.texts = texts
+        self._delta_count = 0
         return f"Loaded {len(self.store)} vectors, dim={dim}"
+
+    def load_delta(self, data_path: str) -> str:
+        if not os.path.exists(data_path):
+            return "No delta file"
+        vecs, texts, dim = StorageIO.load(data_path)
+        self.store.vectors.extend(vecs)
+        self.store.texts.extend(texts)
+        self._delta_count = len(vecs)
+        return f"Loaded {len(vecs)} delta vectors"
+
+    def clear_delta(self) -> str:
+        if self._delta_count < 1 or not hasattr(self, '_delta_count'):
+            return "No delta to clear"
+        self.store.vectors = self.store.vectors[:-self._delta_count]
+        self.store.texts = self.store.texts[:-self._delta_count]
+        self._delta_count = 0
+        return "Delta cleared"
 
     def search(self, query: str, top_k: int = 5) -> list[dict]:
         qv = self.encoder.embed(query)
@@ -48,7 +66,8 @@ class EmbedderApp:
     def info(self) -> str:
         n = len(self.store)
         sample = self.store.texts[:3] if n > 0 else []
-        return json.dumps({"vectors": n, "sample_texts": sample}, ensure_ascii=False)
+        delta = getattr(self, '_delta_count', 0)
+        return json.dumps({"vectors": n, "delta": delta, "sample_texts": sample}, ensure_ascii=False)
 
     def tree_search(self, query: str, top_k: int = 5) -> str:
         if not self.store.vectors:
@@ -135,6 +154,22 @@ def tree_search(query: str, top_k: int = 5) -> str:
     return app.tree_search(query, top_k)
 
 
+@mcp.tool()
+def load_delta(data_path: str) -> str:
+    """Load delta vectors on top of the existing store."""
+    if app is None:
+        return "Error: server not initialized"
+    return app.load_delta(data_path)
+
+
+@mcp.tool()
+def clear_delta() -> str:
+    """Remove delta layer from the store."""
+    if app is None:
+        return "Error: server not initialized"
+    return app.clear_delta()
+
+
 async def main():
     global app
 
@@ -171,6 +206,15 @@ async def main():
         app.init(data_path)
     elif args.data:
         print(f"Data file not found: {data_path}")
+
+    delta_path = os.path.join(data_dir, "delta.npz")
+    if os.path.exists(delta_path):
+        print(f"Loading delta from {delta_path}...")
+        app.load_delta(delta_path)
+
+    tree_delta = os.path.join(data_dir, "delta_tree_index.json")
+    if os.path.exists(tree_delta):
+        print(f"Tree delta found at {tree_delta}")
 
     await mcp.run_stdio_async()
 
