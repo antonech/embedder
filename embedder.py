@@ -175,6 +175,13 @@ class CompositeStrategy(EnrichmentStrategy):
         return cls.from_keys(["kind", "name", "signature", "docstring"])
 
 
+_LABELS_PATH = os.path.join(os.path.dirname(__file__), "labels.json")
+if os.path.exists(_LABELS_PATH):
+    with open(_LABELS_PATH) as f:
+        _LABELS = json.load(f)
+else:
+    _LABELS = {"default": {"file": "[FILE]", "line": "[LINE]", "fallback": "[CHUNK]"}, "mapping": {}}
+
 class ASTParser:
     """Extract enriched chunks from source files for any language.
 
@@ -261,6 +268,7 @@ class ASTParser:
         """
         chunks = []
         strategy = cls._load_strategy(root, enrichment_keys)
+        file_label = _LABELS["default"].get("file", "[file]")
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in cls.SKIP_DIRS]
             for fn in sorted(filenames):
@@ -269,7 +277,7 @@ class ASTParser:
                 try:
                     file_chunks = cls.parse_file(fp, path_hint=name)
                     if file_chunks:
-                        chunks.append(f"[FILE] {name}")
+                        chunks.append(f"{file_label} {name}")
                         for c in file_chunks:
                             if isinstance(c, str):
                                 chunks.append(c)
@@ -280,7 +288,7 @@ class ASTParser:
                                     enriched += f" ({f})"
                                 chunks.append(enriched)
                 except Exception as e:
-                    chunks.append(f"[FILE] {name} (read error: {e})")
+                    chunks.append(f"{file_label} {name} (read error: {e})")
         return chunks
 
     # --- Python handler ---
@@ -300,7 +308,8 @@ class ASTParser:
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
                     doc = ast.get_docstring(node) or ""
-                    chunk = f"{path_hint} class_definition {node.name}"
+                    label = _LABELS["mapping"].get("class_definition", "[cls]")
+                    chunk = f"{label} {path_hint} class_definition {node.name}"
                     if doc:
                         chunk += f" | {doc}"
                     chunks.append(chunk)
@@ -309,7 +318,8 @@ class ASTParser:
                         continue
                     doc = ast.get_docstring(node) or ""
                     args = [a.arg for a in node.args.args]
-                    chunk = f"{path_hint} function_definition {node.name}({', '.join(args)})"
+                    label = _LABELS["mapping"].get("function_definition", "[fn]")
+                    chunk = f"{label} {path_hint} function_definition {node.name}({', '.join(args)})"
                     if doc:
                         chunk += f" | {doc}"
                     chunks.append(chunk)
@@ -322,10 +332,11 @@ class ASTParser:
     @classmethod
     def _parse_fallback(cls, source: str, path_hint: str = "") -> list[str]:
         chunks = []
+        line_label = _LABELS["default"].get("line", "[line]")
         for line in source.split('\n'):
             stripped = line.strip()
             if len(stripped) >= 15:
-                chunks.append(f"[LINE] {stripped[:120]}")
+                chunks.append(f"{line_label} {stripped[:120]}")
         return chunks
 
     # --- C/C++ handler (tree-sitter) ---
@@ -371,7 +382,8 @@ class ASTParser:
                         params = node.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
                         # Build text in the same format as tree parser
-                        text = f"{path_hint} {node.type} {name}"
+                        label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
+                        text = f"{label} {path_hint} {node.type} {name}"
                         if sig_text:
                             text += f" ({sig_text})"
                         if doc:
@@ -436,7 +448,9 @@ class ASTParser:
                         except Exception:
                             signature = ""
                     # Build text in the same format as tree parser
-                    text = f"{path_hint} {cursor.kind.name.lower().replace('_decl', '')} {name}"
+                    type_key = cursor.kind.name.lower().replace('_decl', '')
+                    label = _LABELS["mapping"].get(type_key, f"[{type_key}]")
+                    text = f"{label} {path_hint} {type_key} {name}"
                     if signature:
                         text += f" ({signature})"
                     if doc:
@@ -484,7 +498,8 @@ class ASTParser:
                         params = node.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
                         # Build text in the same format as tree parser
-                        text = f"{path_hint} {node.type} {name}"
+                        label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
+                        text = f"{label} {path_hint} {node.type} {name}"
                         if sig_text:
                             text += f" ({sig_text})"
                         if doc:

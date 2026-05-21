@@ -1,0 +1,26 @@
+{
+  "default": {
+    "file": "[file]",
+    "line": "[line]",
+    "fallback": "[chunk]"
+  },
+  "mapping": {
+    "class_definition": "[cls]",
+    "class_specifier": "[cls]",
+    "struct_specifier": "[strct]",
+    "interface_type": "[intf]",
+    "trait_item": "[trait]",
+    "impl_item": "[impl]",
+    "function_definition": "[fn]",
+    "function_declaration": "[fn]",
+    "function_item": "[fn]",
+    "method_definition": "[fn]",
+    "method_declaration": "[fn]",
+    "type_declaration": "[type]",
+    "enum_specifier": "[enum]",
+    "module": "[mod]",
+    "namespace": "[ns]",
+    "alias_declaration": "[alias]",
+    "typedef_decl": "[type]"
+  }
+}

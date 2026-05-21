@@ -103,13 +103,15 @@ class TreeIndex:
                 if cid in self.nodes and cid != node_id]
 
     def _match_node(self, text: str) -> dict | None:
-        # 1. Clean up the search text: remove potential [LINE] or [FILE] prefixes
+        # 1. Clean up the search text: remove any label in square brackets at the start
         import re
-        cleaned_text = re.sub(r'^\[(?:LINE|FILE|CLASS|FUNC)\]\s*', '', text).strip()
+        cleaned_text = re.sub(r'^\[[^\]]+\]\s*', '', text).strip()
         
         # 2. Try exact match on the stored text
         for n in self.nodes.values():
-            if n["text"] == cleaned_text or n["text"] == text:
+            # Also clean the stored node text for comparison to be safe
+            n_text_cleaned = re.sub(r'^\[[^\]]+\]\s*', '', n["text"]).strip()
+            if n_text_cleaned == cleaned_text or n["text"] == text:
                 return n
         
         # 3. Fallback to parsing: extract file path and name

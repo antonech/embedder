@@ -27,6 +27,14 @@ SIGNIFICANT_TYPES = {
 }
 
 
+_LABELS_PATH = os.path.join(os.path.dirname(__file__), "labels.json")
+if os.path.exists(_LABELS_PATH):
+    with open(_LABELS_PATH) as f:
+        _LABELS = json.load(f)
+else:
+    _LABELS = {"default": {"file": "[file]", "line": "[line]", "fallback": "[chunk]"}, "mapping": {}}
+
+
 def get_name(node) -> str:
     name_node = node.child_by_field_name("name")
     if name_node:
@@ -78,11 +86,13 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
             next_id[0] += 1
             sig = get_signature(node, source, lang)
             doc = get_docstring(node, source)
-            enriched = f"{filepath} {node.type} {name}"
+            
+            label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
+            text = f"{label} {rel_filepath} {node.type} {name}"
             if sig:
-                enriched += f" ({sig})"
+                text += f" ({sig})"
             if doc:
-                enriched += f" | {doc}"
+                text += f" | {doc}"
 
             nodes.append({
                 "id": node_id,
@@ -94,7 +104,7 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
                 "end_line": node.end_point[0] + 1,
                 "signature": sig,
                 "docstring": doc,
-                "text": f"{rel_filepath} {node.type} {name}" + (f" ({sig})" if sig else "") + (f" | {doc}" if doc else ""),
+                "text": text,
             })
             parent_id = node_id
 
