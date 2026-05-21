@@ -29,20 +29,25 @@ done
 PROJECT="$(cd "$PROJECT" && pwd)"
 export PROJECT
 export DELTA
+# --- Environment Setup ---
 ME="$(cd "$(dirname "$0")" && pwd)"
-DATA_DIR="$PROJECT/data"
-mkdir -p "$DATA_DIR"
+VENV="$ME/venv"
+if [ -d "$VENV" ]; then
+    PYTHON="$VENV/bin/python3"
+else
+    PYTHON="python3"
+fi
 
 # --- Flat index via embedder.py ---
 if [ "$DELTA" = false ]; then
-    python3 "$ME/embedder.py" --build-flat --data-dir "$DATA_DIR" --root "$PROJECT"
+    $PYTHON "$ME/embedder.py" --build-flat --data-dir "$DATA_DIR" --root "$PROJECT"
 else
-    python3 "$ME/embedder.py" --build-flat --delta --data-dir "$DATA_DIR" --root "$PROJECT"
+    $PYTHON "$ME/embedder.py" --build-flat --delta --data-dir "$DATA_DIR" --root "$PROJECT"
 fi
 
 # --- Tree index via tree-sitter ---
 if [ "$DELTA" = false ]; then
-    python3 "$ME/tree_ast_parser.py" --root "$PROJECT" --data-dir "$DATA_DIR"
+    $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT" --data-dir "$DATA_DIR"
 else
-    python3 "$ME/tree_ast_parser.py" --root "$PROJECT" --data-dir "$DATA_DIR" --delta
+    $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT" --data-dir "$DATA_DIR" --delta
 fi
