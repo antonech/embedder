@@ -5,7 +5,7 @@ description: Rebuild the enriched vector index from Python source files. Parses 
 
 # Rebuild Vector Index
 
-Parses `.py` files in a project, extracts classes and functions via AST enrichment (name + signature + docstring), embeds, saves to `data/enriched_vectors.npz`.
+Parses `.py`, `.js`, `.ts`, `.go`, `.rs`, `.cpp` and more — extracts classes, functions, methods via AST enrichment (kind + name + signature + docstring), embeds with sentence-transformers, saves to `data/enriched_vectors.npz`.
 
 Accepts any project directory — pass the path as argument.
 
@@ -19,6 +19,19 @@ Accepts any project directory — pass the path as argument.
 /path/to/embedder/rebuild_index.sh /path/to/project
 ```
 
+## Enrichment strategies
+
+Configured in project's `config.json`:
+
+```json
+{
+    "model_name": "paraphrase-multilingual-MiniLM-L12-v2",
+    "enrichment": ["kind", "name", "signature", "docstring"]
+}
+```
+
+Available: `kind`, `name`, `signature`, `docstring`, `body` — combined via `CompositeStrategy`.
+
 ## After rebuild
 
 Load into running MCP:
@@ -27,4 +40,8 @@ Load into running MCP:
 init_store(data/enriched_vectors.npz)
 ```
 
-Or restart MCP with `--data` flag.
+Or restart MCP with `--data-dir`:
+
+```bash
+python mcp_server.py --data-dir /path/to/project/data
+```
