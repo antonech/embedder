@@ -3,42 +3,85 @@ import json, os
 
 class TreeIndex:
     def __init__(self, data_dir="data"):
-        self.nodes = {}
-        self.children = {}
-        self.texts = []
+        self.nodes = {}          # Maps _uid to node dict
+        self.children = {}       # Maps parent _uid to list of child _uids
+        self.texts = []          # Parallel array of texts (same order as nodes by _uid)
+        self.id_map = {}         # Maps identifier (original id + shift) to _uid
 
         tree_path = os.path.join(data_dir, "tree_index.json")
-        if os.path.exists(tree_path):
-            self._load(tree_path)
-
         delta_path = os.path.join(data_dir, "delta_tree_index.json")
-        if os.path.exists(delta_path):
-            self._load(delta_path)
 
-    def _load(self, tree_path):
+        uid = 0
+        max_orig_main = -1
+        if os.path.exists(tree_path):
+            uid, max_orig_main = self._load(tree_path, start_uid=uid, id_shift=0)
+
+        if os.path.exists(delta_path):
+            # Shift the delta by max_orig_main + 1 to avoid id overlap
+            uid, _ = self._load(delta_path, start_uid=uid, id_shift=max_orig_main + 1)
+
+    def _load(self, tree_path, start_uid=0, id_shift=0):
+        """Load nodes from a tree index file.
+
+        Args:
+            tree_path: Path to the JSON file.
+            start_uid: The starting _uid to assign to nodes from this file.
+            id_shift: The value to add to the original 'id' and 'parent_id' to get the identifier used in id_map.
+
+        Returns:
+            (next_uid, max_original_id) where next_uid is the next available _uid after loading,
+            and max_original_id is the maximum original 'id' found in this file (before shifting).
+        """
         with open(tree_path) as f:
             data = json.load(f)
 
-        uid = 0
-        id_map = {}
+        uid = start_uid
+        max_original_id_without_shift = -1
+        # First pass: assign _uid and store mapping from (original_id + id_shift) to _uid
         for n in data["nodes"]:
-            old_id = n["id"]
-            n["_uid"] = uid
+            original_id = n["id"]
+            if original_id > max_original_id_without_shift:
+                max_original_id_without_shift = original_id
+            shifted_id = original_id + id_shift
+            original_parent_id = n.get("parent_id", -1)
+            # We'll store the shifted parent id temporarily in the node (to be resolved later)
+            n["_shifted_parent_id"] = original_parent_id + id_shift if original_parent_id != -1 else -1
+            # Remove the original id field
             n.pop("id", None)
+            # Remove the original parent_id field (we'll use _shifted_parent_id for now)
+            n.pop("parent_id", None)
+            # Assign sequential _uid
+            n["_uid"] = uid
             self.nodes[uid] = n
-            id_map[old_id] = uid
+            # Map the identifier (shifted_id) to _uid
+            self.id_map[shifted_id] = uid
             uid += 1
 
-        for n in self.nodes.values():
-            pid = n.get("parent_id", -1)
-            mapped = id_map.get(pid, -1)
-            n["parent_id"] = mapped
-            nid = n["_uid"]
-            if mapped not in self.children:
-                self.children[mapped] = []
-            self.children[mapped].append(nid)
+        # Extend the texts
+        self.texts.extend(data["texts"])
 
-        self.texts = data["texts"]
+        # Second pass: resolve parent_id to _uid using the id_map
+        for n in self.nodes.values():
+            shifted_parent_id = n.get("_shifted_parent_id", -1)
+            if shifted_parent_id == -1:
+                n["parent_id"] = -1
+            else:
+                # Look up the _uid of the parent using the identifier (shifted_parent_id)
+                n["parent_id"] = self.id_map.get(shifted_parent_id, -1)
+            # Remove the temporary field
+            n.pop("_shifted_parent_id", None)
+
+        # Rebuild the entire children mapping using the current id_map (which maps identifier to _uid)
+        self.children = {}
+        for nid, n in self.nodes.items():
+            parent_uid = n.get("parent_id", -1)
+            if parent_uid == -1:
+                continue
+            if parent_uid not in self.children:
+                self.children[parent_uid] = []
+            self.children[parent_uid].append(nid)
+
+        return uid, max_original_id_without_shift
 
     def get_node(self, node_id: int) -> dict | None:
         return self.nodes.get(node_id)
