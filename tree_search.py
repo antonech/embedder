@@ -103,54 +103,36 @@ class TreeIndex:
                 if cid in self.nodes and cid != node_id]
 
     def _match_node(self, text: str) -> dict | None:
-        # First, try exact match on the stored text (which is the same as the node's text)
+        # 1. Clean up the search text: remove potential [LINE] or [FILE] prefixes
+        import re
+        cleaned_text = re.sub(r'^\[(?:LINE|FILE|CLASS|FUNC)\]\s*', '', text).strip()
+        
+        # 2. Try exact match on the stored text
         for n in self.nodes.values():
-            if n["text"] == text:
+            if n["text"] == cleaned_text or n["text"] == text:
                 return n
         
-        # Fallback to parsing the text to extract file and name
-        import re
+        # 3. Fallback to parsing: extract file path and name
+        # The expected format is: "filepath type name (signature) | docstring"
         
-        # Try to match the pattern: "filepath type name (signature) | docstring" or "filepath type name"
-        # First, split by ' | ' to separate the main part from docstring
-        main_part = text.split(' | ')[0].strip()
+        # Remove docstring part if present
+        base_part = cleaned_text.split(' | ')[0].strip()
+        tokens = base_part.split()
         
-        # Now try to extract file, type, name from main_part
-        # The format is: "filepath type name (signature)" or "filepath type name"
-        tokens = main_part.split()
         if len(tokens) >= 3:
-            # First token is file, second is type, the rest is name (possibly with signature in parentheses)
-            file = tokens[0]
-            # type = tokens[1]  # we don't need type for matching
-            # Reconstruct the name from remaining tokens
-            name_tokens = tokens[2:]
-            name = ' '.join(name_tokens)
+            # Format: filepath type name...
+            file_path = tokens[0].lstrip("./")
+            # The name might contain spaces or signatures
+            name_part = ' '.join(tokens[2:])
             
-            # Remove trailing signature in parentheses if present
-            if name.endswith(')'):
-                # Find the opening parenthesis that matches the closing one
-                # Simple approach: remove everything from the last ' (' to the end
-                if ' (' in name:
-                    name = name.rsplit(' (', 1)[0]
+            # Strip signature if present: "name (arg1, arg2)" -> "name"
+            # We use rsplit to handle cases where name itself might have parentheses
+            pure_name = name_part.rsplit(' (', 1)[0] if ' (' in name_part else name_part
             
-            # Look for the node with matching file and name
             for n in self.nodes.values():
                 nf = n["file"].lstrip("./")
-                if nf == file and n["name"] == name:
+                if nf == file_path and n["name"] == pure_name:
                     return n
-        
-        # If that didn't work, try a more flexible approach: just look for file and name substrings
-        # Extract potential file path (first token that looks like a path)
-        for token in tokens:
-            if '/' in token or '.' in token:  # likely a file path
-                # Try to find a node with this file
-                for n in self.nodes.values():
-                    nf = n["file"].lstrip("./")
-                    if nf == token:
-                        # If we found a file match, try to match the name as well
-                        # For simplicity, if file matches exactly, return it (best we can do)
-                        return n
-                break
         
         return None
 
