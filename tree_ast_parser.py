@@ -131,13 +131,14 @@ def parse_file(filepath: str, next_id: list | None = None, root: str = ".") -> l
 def _resolve_data_dir(root: str, data_dir: str | None) -> str:
     if data_dir:
         return data_dir
-    embedder_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    embedder_cfg = os.path.join(script_dir, "config.json")
     if os.path.exists(embedder_cfg):
         with open(embedder_cfg) as f:
             cfg = json.load(f)
         store_root = cfg.get("embedding_store")
         if store_root:
-            return os.path.join(store_root, os.path.basename(root))
+            return os.path.abspath(os.path.join(script_dir, store_root, os.path.basename(root)))
     return ""
 
 

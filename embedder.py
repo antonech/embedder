@@ -613,13 +613,14 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
     """
     # Compute data_dir from embedder config if not explicitly given
     if data_dir is None:
-        embedder_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        embedder_cfg = os.path.join(script_dir, "config.json")
         if os.path.exists(embedder_cfg):
             with open(embedder_cfg) as f:
                 ecfg = json.load(f)
             store_root = ecfg.get("embedding_store")
             if store_root:
-                data_dir = os.path.join(store_root, os.path.basename(root))
+                data_dir = os.path.abspath(os.path.join(script_dir, store_root, os.path.basename(root)))
     if not data_dir:
         data_dir = "data"
 
