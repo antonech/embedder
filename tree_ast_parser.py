@@ -128,7 +128,21 @@ def parse_file(filepath: str, next_id: list | None = None, root: str = ".") -> l
     return nodes
 
 
-def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}):
+def _resolve_data_dir(root: str, data_dir: str | None) -> str:
+    if data_dir:
+        return data_dir
+    embedder_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if os.path.exists(embedder_cfg):
+        with open(embedder_cfg) as f:
+            cfg = json.load(f)
+        store_root = cfg.get("embedding_store")
+        if store_root:
+            return os.path.join(store_root, os.path.basename(root))
+    return ""
+
+
+def build_index(root=".", data_dir=None, exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}):
+    data_dir = _resolve_data_dir(root, data_dir) or "data"
     model = EmbeddingModel()
     store = VectorStore()
     all_nodes = []
@@ -153,9 +167,9 @@ def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "
         all_nodes.extend(nodes)
         print(f"  {fp}: {len(nodes)} nodes")
 
-    os.makedirs(data_dir or "data", exist_ok=True)
-    vec_path = os.path.join(data_dir or "data", "tree_vectors.npz")
-    json_path = os.path.join(data_dir or "data", "tree_index.json")
+    os.makedirs(data_dir, exist_ok=True)
+    vec_path = os.path.join(data_dir, "tree_vectors.npz")
+    json_path = os.path.join(data_dir, "tree_index.json")
     StorageIO.save(vec_path, store.vectors, store.texts, model.dim)
 
     tree_data = {"nodes": all_nodes, "texts": store.texts}
@@ -166,7 +180,8 @@ def build_index(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "
     return model, store, all_nodes
 
 
-def build_delta(root=".", data_dir="data", exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}):
+def build_delta(root=".", data_dir=None, exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}):
+    data_dir = _resolve_data_dir(root, data_dir) or "data"
     changed = subprocess.run(
         ["git", "diff", "--name-only", "HEAD"],
         capture_output=True, text=True, cwd=root
@@ -215,7 +230,7 @@ if __name__ == "__main__":
     import argparse, subprocess
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
-    parser.add_argument("--data-dir", default="data")
+    parser.add_argument("--data-dir", default=None)
     parser.add_argument("--delta", action="store_true", help="parse only files changed in HEAD")
     args = parser.parse_args()
     if args.delta:

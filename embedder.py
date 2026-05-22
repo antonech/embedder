@@ -602,15 +602,28 @@ class StorageIO:
         return vectors, texts, dim
 
 
-def build_flat_index(root: str, data_dir: str = "data", delta: bool = False) -> None:
+def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False) -> None:
     """Build flat vector index for a project.
 
     Args:
         root: Project root directory.
         data_dir: Directory to save the index (relative to root).
+                  If not given, computed from config embedding_store + project name.
         delta: If True, build delta index (only changed files).
     """
-    # Load configuration
+    # Compute data_dir from embedder config if not explicitly given
+    if data_dir is None:
+        embedder_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        if os.path.exists(embedder_cfg):
+            with open(embedder_cfg) as f:
+                ecfg = json.load(f)
+            store_root = ecfg.get("embedding_store")
+            if store_root:
+                data_dir = os.path.join(store_root, os.path.basename(root))
+    if not data_dir:
+        data_dir = "data"
+
+    # Load project configuration
     cfg_path = os.path.join(root, "config.json")
     model_name = "all-MiniLM-L6-v2"
     device = None
@@ -635,8 +648,8 @@ def build_flat_index(root: str, data_dir: str = "data", delta: bool = False) -> 
         changed = [f.strip() for f in result.stdout.split('\n') if f.strip()]
         if not changed:
             print("Delta: no changed files")
-            StorageIO.save(f'{project}/data/delta.npz', [], [], enc.dim)
-            with open(f'{project}/data/delta_texts.json', 'w') as f:
+            StorageIO.save(os.path.join(project, data_dir, 'delta.npz'), [], [], enc.dim)
+            with open(os.path.join(project, data_dir, 'delta_texts.json'), 'w') as f:
                 json.dump({"files": [], "texts": [], "model": model_name}, f)
             return
 
@@ -656,15 +669,15 @@ def build_flat_index(root: str, data_dir: str = "data", delta: bool = False) -> 
 
         if not chunks:
             print("Delta: no parseable chunks")
-            StorageIO.save(f'{project}/data/delta.npz', [], [], enc.dim)
-            with open(f'{project}/data/delta_texts.json', 'w') as f:
+            StorageIO.save(os.path.join(project, data_dir, 'delta.npz'), [], [], enc.dim)
+            with open(os.path.join(project, data_dir, 'delta_texts.json'), 'w') as f:
                 json.dump({"files": changed, "texts": [], "model": model_name}, f)
             return
 
         vecs = enc.embed_many(chunks)
         store.add_many(vecs, chunks)
 
-        out_vec = f'{project}/data/delta.npz'
+        out_vec = os.path.join(project, data_dir, 'delta.npz')
         os.makedirs(os.path.dirname(out_vec), exist_ok=True)
         StorageIO.save(out_vec, store.vectors, store.texts, enc.dim)
 
@@ -673,7 +686,7 @@ def build_flat_index(root: str, data_dir: str = "data", delta: bool = False) -> 
             "texts": chunks,
             "model": model_name,
         }
-        with open(f'{project}/data/delta_texts.json', 'w') as f:
+        with open(os.path.join(project, data_dir, 'delta_texts.json'), 'w') as f:
             json.dump(delta_data, f, ensure_ascii=False)
 
         print(f"Delta index: {len(chunks)} chunks from {len(changed)} files -> {out_vec}")
@@ -683,7 +696,7 @@ def build_flat_index(root: str, data_dir: str = "data", delta: bool = False) -> 
         vecs = enc.embed_many(chunks)
         store.add_many(vecs, chunks)
 
-        out = f'{project}/data/enriched_vectors.npz'
+        out = os.path.join(project, data_dir, 'enriched_vectors.npz')
         os.makedirs(os.path.dirname(out), exist_ok=True)
         StorageIO.save(out, store.vectors, store.texts, enc.dim)
         print(f"Flat index: {len(chunks)} chunks -> {out}")
@@ -693,7 +706,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Build flat vector index for a project.')
     parser.add_argument('--build-flat', action='store_true', help='Build the flat index')
     parser.add_argument('--delta', action='store_true', help='Build delta index (only changed files)')
-    parser.add_argument('--data-dir', default='data', help='Directory to save the index')
+    parser.add_argument('--data-dir', default=None, help='Directory to save the index (default: from config)')
     parser.add_argument('--root', default='.', help='Project root directory')
     args = parser.parse_args()
 
