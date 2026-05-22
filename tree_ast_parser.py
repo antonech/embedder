@@ -139,7 +139,7 @@ def _resolve_data_dir(root: str, data_dir: str | None) -> str:
         store_root = cfg.get("embedding_store")
         if store_root:
             store_root = os.path.expandvars(os.path.expanduser(store_root))
-            return os.path.abspath(os.path.join(script_dir, store_root, os.path.basename(root)))
+            return os.path.join(store_root, os.path.basename(root))
     return ""
 
 

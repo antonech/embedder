@@ -202,7 +202,7 @@ async def main():
         data_dir = os.path.dirname(args.data) or "data"
     elif cfg.get("embedding_store"):
         store_root = os.path.expandvars(os.path.expanduser(cfg["embedding_store"]))
-        data_dir = os.path.abspath(os.path.join(script_dir, store_root))
+        data_dir = store_root
         if args.root:
             data_dir = os.path.join(data_dir, os.path.basename(os.path.abspath(args.root)))
     else:
