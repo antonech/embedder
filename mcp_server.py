@@ -19,6 +19,9 @@ class EmbedderApp:
         self.store.vectors = vecs
         self.store.texts = texts
         self._delta_count = 0
+        self.data_dir = os.path.dirname(data_path)
+        if hasattr(self, "_tree"):
+            del self._tree
         return f"Loaded {len(self.store)} vectors, dim={dim}"
 
     def load_delta(self, data_path: str) -> str:
@@ -177,24 +180,30 @@ async def main():
     parser.add_argument("--model", default=None)
     parser.add_argument("--data", default="")
     parser.add_argument("--data-dir", default="")
+    parser.add_argument("--root", default=None)
     args = parser.parse_args()
 
     model_name = args.model
     device = None
+    cfg = {}
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg_path = os.path.join(script_dir, "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+
     if model_name is None:
-        cfg_path = "config.json"
-        if os.path.exists(cfg_path):
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-                model_name = cfg.get("model_name", "all-MiniLM-L6-v2")
-                device = cfg.get("device")
-        else:
-            model_name = "all-MiniLM-L6-v2"
+        model_name = cfg.get("model_name", "all-MiniLM-L6-v2")
+        device = cfg.get("device")
 
     if args.data_dir:
         data_dir = args.data_dir
     elif args.data:
         data_dir = os.path.dirname(args.data) or "data"
+    elif cfg.get("embedding_store"):
+        data_dir = os.path.join(script_dir, cfg["embedding_store"])
+        if args.root:
+            data_dir = os.path.join(data_dir, os.path.basename(os.path.abspath(args.root)))
     else:
         data_dir = "data"
 

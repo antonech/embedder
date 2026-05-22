@@ -7,12 +7,12 @@
 #   (default)  Full rebuild — scans all files, saves enriched_vectors.npz
 #   --delta    Delta rebuild — only changed files (git diff), saves delta.npz + delta_texts.json
 #
-# Builds:
-#   - data/enriched_vectors.npz  — flat AST search
-#   - data/delta.npz             — delta vectors (changed files only)
-#   - data/delta_texts.json      — delta chunk texts
-#   - data/tree_vectors.npz      — tree-sitter AST index
-#   - data/tree_index.json       — hierarchical AST nodes
+# Builds (per-project in embedder_store/$(basename <project>)/):
+#   - enriched_vectors.npz       — flat AST search
+#   - delta.npz                  — delta vectors (changed files only)
+#   - delta_texts.json           — delta chunk texts
+#   - tree_vectors.npz           — tree-sitter AST index
+#   - tree_index.json            — hierarchical AST nodes
 
 set -e
 DELTA=false
@@ -38,16 +38,16 @@ else
     PYTHON="python3"
 fi
 
-# --- Flat index via embedder.py ---
+# --- Flat index via embedder.py (data_dir computed from config + project name) ---
 if [ "$DELTA" = false ]; then
-    $PYTHON "$ME/embedder.py" --build-flat --data-dir "$DATA_DIR" --root "$PROJECT"
+    $PYTHON "$ME/embedder.py" --build-flat --root "$PROJECT"
 else
-    $PYTHON "$ME/embedder.py" --build-flat --delta --data-dir "$DATA_DIR" --root "$PROJECT"
+    $PYTHON "$ME/embedder.py" --build-flat --delta --root "$PROJECT"
 fi
 
 # --- Tree index via tree-sitter ---
 if [ "$DELTA" = false ]; then
-    $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT" --data-dir "$DATA_DIR"
+    $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT"
 else
-    $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT" --data-dir "$DATA_DIR" --delta
+    $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT" --delta
 fi
