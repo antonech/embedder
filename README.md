@@ -17,19 +17,21 @@ System deps: `libclang-18-dev` (for C++ parsing).
 ### Rebuild indices
 ```bash
 ./rebuild_index.sh /path/to/project
+./rebuild_index.sh --delta /path/to/project   # only changed files
 ```
 Scans project, parses AST (Python, C++, JavaScript, TypeScript, Go, Rust), embeds with sentence-transformers.
-Builds both:
-- `data/enriched_vectors.npz` — flat AST search
-- `data/tree_vectors.npz` + `data/tree_index.json` — hierarchical AST context (parent/children/siblings)
+Builds per-project in `embedder_store/<project_name>/`:
+- `enriched_vectors.npz` — flat AST search
+- `tree_vectors.npz` + `tree_index.json` — hierarchical AST context (parent/children/siblings)
+- `delta.npz` + `delta_texts.json` — incremental delta index (when `--delta`)
 
 ### MCP server (OpenCode integration)
 ```bash
-python mcp_server.py --data-dir data
+python mcp_server.py --root /path/to/project
 ```
-Or for another project:
-```bash
-python mcp_server.py --data-dir /path/to/project/data
+Or via opencode.json:
+```json
+"command": ["./venv/bin/python", "./mcp_server.py", "--root", "/path/to/project"]
 ```
 
 Registers tools: `search`, `tree_search`, `embed`, `embed_many`, `init_store`, `add_document`, `add_documents`, `save_store`, `store_info`.
@@ -48,9 +50,10 @@ Then trigger via opencode: `skill rebuild-index /path/to/project`
 | `mcp_server.py` | FastMCP server — 9 tools for semantic search |
 | `tree_search.py` | TreeIndex — AST context overlay (parent/children/siblings) |
 | `tree_ast_parser.py` | Build tree_index.json + tree_vectors.npz via tree-sitter |
-| `rebuild_index.sh` | Full pipeline: scan → embed → persist |
+| `rebuild_index.sh` | Full pipeline: scan → embed → persist (supports `--delta`) |
 | `skills/rebuild-index/` | OpenCode skill definition |
-| `config.json` | Model name, enrichment keys |
+| `config.json` | Model name, enrichment keys, `embedding_store` path |
+| `labels.json` | Tree-sitter node type → label mapping |
 
 ## Architecture
 
@@ -61,11 +64,14 @@ ASTParser (Python ast / libclang / tree-sitter)
     ↓
 EnrichmentStrategy chain (kind | name | signature | docstring)
     ↓
-EmbeddingModel → VectorStore → enriched_vectors.npz
-    ↓                                ↓
-search() ← flat search     TreeIndex (tree_vectors.npz)
-                                  ↓
-                           tree_search() ← context (parent/children/siblings)
+EmbeddingModel → VectorStore → embedder_store/<project>/
+                                    ↓
+        ┌───────────────────────────┼───────────────────────┐
+        ↓                           ↓                       ↓
+ enriched_vectors.npz       tree_vectors.npz          delta.npz
+  (flat search)         + tree_index.json          + delta_texts.json
+                             (tree search,           (incremental)
+                          parent/children/siblings)
 ```
 
 ## Model (embedding)
@@ -95,8 +101,13 @@ Order matters: `["kind", "name", "signature", "docstring"]` produces e.g. `[CLAS
 ```json
 {
     "model_name": "paraphrase-multilingual-MiniLM-L12-v2",
-    "enrichment": ["kind", "name", "signature", "docstring"]
+    "enrichment": ["kind", "name", "signature", "docstring"],
+    "embedding_store": "../embedder_store",
+    "device": "cpu"
 }
 ```
+
+- `embedding_store` — base directory for per-project indices (resolved relative to embedder)
+- `device` — `"cpu"`, `"cuda"`, or omit for auto-detect
 
 Priority: explicit arg > config.json > defaults.
