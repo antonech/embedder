@@ -4,5 +4,5 @@
     "top_k": 5,
     "enrichment": ["kind", "name", "signature", "docstring"],
     "use_clang": true,
-    "embedding_store": "../embedder_store"
+    "embedding_store": "~/project/embedder_store"
 }

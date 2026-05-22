@@ -102,12 +102,12 @@ Order matters: `["kind", "name", "signature", "docstring"]` produces e.g. `[CLAS
 {
     "model_name": "paraphrase-multilingual-MiniLM-L12-v2",
     "enrichment": ["kind", "name", "signature", "docstring"],
-    "embedding_store": "../embedder_store",
+    "embedding_store": "~/project/embedder_store",
     "device": "cpu"
 }
 ```
 
-- `embedding_store` — base directory for per-project indices (resolved relative to embedder)
+- `embedding_store` — base directory for per-project indices (supports `~` expansion, resolved relative to embedder if not absolute)
 - `device` — `"cpu"`, `"cuda"`, or omit for auto-detect
 
 Priority: explicit arg > config.json > defaults.
