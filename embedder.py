@@ -620,7 +620,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
                 ecfg = json.load(f)
             store_root = ecfg.get("embedding_store")
             if store_root:
-                store_root = os.path.expanduser(store_root)
+                store_root = os.path.expandvars(os.path.expanduser(store_root))
                 data_dir = os.path.abspath(os.path.join(script_dir, store_root, os.path.basename(root)))
     if not data_dir:
         data_dir = "data"

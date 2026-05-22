@@ -107,7 +107,7 @@ Order matters: `["kind", "name", "signature", "docstring"]` produces e.g. `[CLAS
 }
 ```
 
-- `embedding_store` — base directory for per-project indices (supports `~` expansion, resolved relative to embedder if not absolute)
+- `embedding_store` — base directory for per-project indices (supports `~` and `$VAR` expansion, resolved relative to embedder if not absolute)
 - `device` — `"cpu"`, `"cuda"`, or omit for auto-detect
 
 Priority: explicit arg > config.json > defaults.
