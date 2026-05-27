@@ -73,8 +73,73 @@ def get_signature(node, source: bytes, lang: str) -> str:
     return ""
 
 
+def get_base_classes(node, source: bytes) -> str:
+    bases = []
+    for child in node.children:
+        if child.type == "base_class_clause":
+            for cc in child.children:
+                if cc.type == "type_identifier":
+                    bases.append(cc.text.decode("utf8", errors="ignore"))
+    if bases:
+        return ": " + ", ".join(bases)
+    return ""
+
+
+def get_body_summary(node, source: bytes) -> str:
+    body = None
+    for c in node.children:
+        if c.type == "field_declaration_list":
+            body = c
+            break
+    if not body:
+        return ""
+    access = "public"
+    methods = []
+    fields = []
+    for c in body.children:
+        if c.type == "access_specifier":
+            access = c.text.decode("utf8", errors="ignore").strip()
+        elif c.type == "declaration":
+            txt = c.text.decode("utf8", errors="ignore").strip()
+            if txt.startswith("virtual") or "(" in txt:
+                methods.append(f"{access}: {txt.split('(')[0].split()[-1]}(...)")
+        elif c.type == "function_definition":
+            nname = c.child_by_field_name("name")
+            sig = ""
+            if c.child_by_field_name("parameters"):
+                sig = c.child_by_field_name("parameters").text.decode("utf8", errors="ignore")[:40]
+            if nname:
+                methods.append(f"{access}: {nname.text.decode()}{sig}")
+        elif c.type == "field_declaration":
+            txt = c.text.decode("utf8", errors="ignore").strip()
+            if "(" in txt and txt.split("(")[0].strip().split()[-1]:
+                mname = txt.split("(")[0].strip().split()[-1]
+                sig = "(" + txt.split("(")[1][:40]
+                methods.append(f"{access}: {mname}{sig}")
+            else:
+                parts = txt.split()
+                if parts and parts[-1] not in ("override", "= 0", "final"):
+                    fname = parts[-1].rstrip(";=,")
+                    if fname and not fname.startswith("//"):
+                        fields.append(fname)
+    result = []
+    if methods:
+        result.append("Methods: " + ", ".join(methods[:8]))
+    if fields:
+        result.append("Fields: " + ", ".join(fields[:6]))
+    return ". ".join(result) if result else ""
+
+
+def get_template_params(node, source: bytes, lang: str) -> str:
+    if lang not in ("cpp", "h"):
+        return ""
+    for child in node.children:
+        if child.type == "template_parameter_list":
+            return child.text.decode("utf8", errors="ignore")
+    return ""
+
+
 def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None, root: str = "."):
-    # Compute the relative path from root to filepath
     rel_filepath = os.path.relpath(filepath, root)
     if next_id is None:
         next_id = [0]
@@ -86,13 +151,34 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
             next_id[0] += 1
             sig = get_signature(node, source, lang)
             doc = get_docstring(node, source)
-            
-            label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
-            text = f"{label} {rel_filepath} {node.type} {name}"
+
+            extra_parts = []
+
+            # Template parameters
+            tpl = get_template_params(node, source, lang)
+            if tpl:
+                extra_parts.append(f"template {tpl}")
+
+            # Base classes for class/struct
+            if node.type in ("class_specifier", "struct_specifier"):
+                bases = get_base_classes(node, source)
+                if bases:
+                    extra_parts.append(bases)
+
+            # Body summary
+            body = get_body_summary(node, source)
+            if body:
+                extra_parts.append(f"{{ {body} }}")
+
+            label = _LABELS["mapping"].get(node.type, node.type)
+            text = f"{label} {rel_filepath} {name}"
+            if extra_parts:
+                text += ". " + ". ".join(extra_parts)
             if sig:
-                text += f" ({sig})"
+                text += f". Signature: {sig}"
             if doc:
-                text += f" | {doc}"
+                doc_short = doc.strip().replace("\n", " ")[:200]
+                text += f". Doc: {doc_short}"
 
             nodes.append({
                 "id": node_id,

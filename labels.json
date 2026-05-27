@@ -1,26 +1,31 @@
 {
   "default": {
-    "file": "[file]",
-    "line": "[line]",
-    "fallback": "[chunk]"
+    "file": "File",
+    "line": "Line",
+    "fallback": "Chunk"
   },
   "mapping": {
-    "class_definition": "[cls]",
-    "class_specifier": "[cls]",
-    "struct_specifier": "[strct]",
-    "interface_type": "[intf]",
-    "trait_item": "[trait]",
-    "impl_item": "[impl]",
-    "function_definition": "[fn]",
-    "function_declaration": "[fn]",
-    "function_item": "[fn]",
-    "method_definition": "[fn]",
-    "method_declaration": "[fn]",
-    "type_declaration": "[type]",
-    "enum_specifier": "[enum]",
-    "module": "[mod]",
-    "namespace": "[ns]",
-    "alias_declaration": "[alias]",
-    "typedef_decl": "[type]"
+    "class_definition": "Class",
+    "class_specifier": "Class",
+    "struct_specifier": "Struct",
+    "interface_type": "Interface",
+    "trait_item": "Trait",
+    "impl_item": "Impl",
+    "function_definition": "Function",
+    "function_declaration": "Function",
+    "function_item": "Function",
+    "function_signature": "Function",
+    "method_definition": "Method",
+    "method_declaration": "Method",
+    "method_signature": "Method",
+    "template_function": "Function",
+    "template_method": "Method",
+    "type_declaration": "Type",
+    "enum_specifier": "Enum",
+    "module": "Module",
+    "namespace": "Namespace",
+    "alias_declaration": "Alias",
+    "typedef_decl": "Type",
+    "declaration": "Declaration"
   }
 }

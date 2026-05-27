@@ -180,7 +180,7 @@ if os.path.exists(_LABELS_PATH):
     with open(_LABELS_PATH) as f:
         _LABELS = json.load(f)
 else:
-    _LABELS = {"default": {"file": "[FILE]", "line": "[LINE]", "fallback": "[CHUNK]"}, "mapping": {}}
+    _LABELS = {"default": {"file": "[file]", "line": "[line]", "fallback": "[chank]"}, "mapping": {}}
 
 class ASTParser:
     """Extract enriched chunks from source files for any language.
@@ -191,6 +191,7 @@ class ASTParser:
     """
 
     SKIP_DIRS = {'venv', '.git', '__pycache__', 'node_modules'}
+    SKIP_PREFIXES = {'[line]', '[file]'}
 
     _handlers: dict[str, callable] = {}
     _use_clang = False  # class variable, set by scan_project from config
@@ -274,12 +275,14 @@ class ASTParser:
             for fn in sorted(filenames):
                 fp = os.path.join(dirpath, fn)
                 name = os.path.relpath(fp, root)
+                # Parse every file; unregistered types (XML, .sh, .md) use fallback
                 try:
                     file_chunks = cls.parse_file(fp, path_hint=name)
                     if file_chunks:
-                        chunks.append(f"{file_label} {name}")
                         for c in file_chunks:
                             if isinstance(c, str):
+                                if c.startswith(tuple(cls.SKIP_PREFIXES)):
+                                    continue
                                 chunks.append(c)
                             else:
                                 enriched = strategy.enrich(c)
@@ -288,7 +291,7 @@ class ASTParser:
                                     enriched += f" ({f})"
                                 chunks.append(enriched)
                 except Exception as e:
-                    chunks.append(f"{file_label} {name} (read error: {e})")
+                    pass
         return chunks
 
     # --- Python handler ---
@@ -308,35 +311,71 @@ class ASTParser:
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
                     doc = ast.get_docstring(node) or ""
-                    label = _LABELS["mapping"].get("class_definition", "[cls]")
-                    chunk = f"{label} {path_hint} class_definition {node.name}"
+                    chunk = f"Class {node.name} in {path_hint}"
+                    if node.bases:
+                        bases = [b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else str(b)) for b in node.bases]
+                        chunk += f". Inherits: {', '.join(bases)}"
+                    methods = [n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                    if methods:
+                        chunk += f". Methods: {', '.join(methods[:6])}"
                     if doc:
-                        chunk += f" | {doc}"
+                        doc_short = doc.strip().replace("\n", " ")[:200]
+                        chunk += f". Doc: {doc_short}"
                     chunks.append(chunk)
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if hasattr(node, 'parent') and isinstance(node.parent, ast.ClassDef):
                         continue
                     doc = ast.get_docstring(node) or ""
                     args = [a.arg for a in node.args.args]
-                    label = _LABELS["mapping"].get("function_definition", "[fn]")
-                    chunk = f"{label} {path_hint} function_definition {node.name}({', '.join(args)})"
+                    
+                    # Extract meaningful subwords from function name for enrichment
+                    import re
+                    subwords = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', node.name)
+                    # Also split by underscore if present
+                    if '_' in node.name:
+                        subwords = [word for subword in subwords for word in subword.split('_')]
+                    subwords = [sw.lower() for sw in subwords if sw]
+                    
+                    chunk = f"Function {node.name} in {path_hint}"
+                    if len(subwords) > 1:
+                        chunk += f" ({' '.join(subwords)})"
+                    chunk += f". Args: ({', '.join(args)})"
+                    try:
+                        body_lines = [ast.unparse(s)[:80] for s in node.body[:2]]
+                        if body_lines:
+                            chunk += f". Body: {'; '.join(body_lines)}"
+                    except Exception:
+                        pass
                     if doc:
-                        chunk += f" | {doc}"
+                        doc_short = doc.strip().replace("\n", " ")[:200]
+                        chunk += f". Doc: {doc_short}"
                     chunks.append(chunk)
         except SyntaxError as e:
-            chunks.append(f"[FILE] {path_hint} (parse error: {e})")
-        return chunks if chunks else cls._parse_fallback(source, path_hint)
+            chunks.append(f"[file] {path_hint} (parse error: {e})")
+        return chunks
 
     # --- Fallback: line-based chunking ---
 
     @classmethod
-    def _parse_fallback(cls, source: str, path_hint: str = "") -> list[str]:
+    def _parse_fallback(cls, source: str, path_hint: str = "", label: str = "") -> list[str]:
         chunks = []
-        line_label = _LABELS["default"].get("line", "[line]")
-        for line in source.split('\n'):
+        blabel = label or _LABELS["default"].get("file", "File")
+        lines = source.split('\n')
+        block_lines = []
+        for line in lines:
             stripped = line.strip()
-            if len(stripped) >= 15:
-                chunks.append(f"{line_label} {stripped[:120]}")
+            if stripped:
+                block_lines.append(stripped)
+            else:
+                if block_lines:
+                    block_text = ' '.join(block_lines)
+                    if len(block_text) >= 20:
+                        chunks.append(f"{blabel} {path_hint} {block_text[:512]}")
+                    block_lines = []
+        if block_lines:
+            block_text = ' '.join(block_lines)
+            if len(block_text) >= 20:
+                chunks.append(f"{blabel} {path_hint} {block_text[:512]}")
         return chunks
 
     # --- C/C++ handler (tree-sitter) ---
@@ -345,7 +384,7 @@ class ASTParser:
         "class_specifier", "struct_specifier",
         "function_definition", "template_function",
         "template_method", "enum_specifier",
-        "alias_declaration",
+        "alias_declaration", "declaration",
     }
 
     @classmethod
@@ -355,13 +394,13 @@ class ASTParser:
             return cls._parse_cpp_clang(source, path_hint)
         # Otherwise use tree-sitter
         if not _TS_AVAILABLE:
-            return cls._parse_fallback(source, path_hint)
+            return cls._parse_fallback(source, path_hint, "Block")
         try:
             from tree_sitter import Language, Parser
             import tree_sitter_cpp
             lang = Language(tree_sitter_cpp.language())
         except Exception:
-            return cls._parse_fallback(source, path_hint)
+            return cls._parse_fallback(source, path_hint, "Block")
 
         chunks: list[str] = []
         try:
@@ -369,10 +408,148 @@ class ASTParser:
             tree = parser.parse(source.encode("utf8", errors="ignore"))
             root = tree.root_node
 
-            def walk(node):
+            def _ts_base_classes(n):
+                bases = []
+                for c in n.children:
+                    if c.type == "base_class_clause":
+                        for cc in c.children:
+                            if cc.type == "type_identifier":
+                                bases.append(cc.text.decode("utf8", errors="ignore"))
+                if bases:
+                    return ": " + ", ".join(bases)
+                return ""
+
+            def _ts_body_summary(n):
+                body = None
+                for c in n.children:
+                    if c.type == "field_declaration_list":
+                        body = c
+                        break
+                if not body:
+                    return ""
+                access = "public"
+                methods = []
+                fields = []
+                for c in body.children:
+                    if c.type == "access_specifier":
+                        access = c.text.decode("utf8", errors="ignore").strip()
+                    elif c.type == "declaration":
+                        txt = c.text.decode("utf8", errors="ignore").strip()
+                        if txt.startswith("virtual") or "(" in txt:
+                            methods.append(f"{access}: {txt.split('(')[0].split()[-1]}(...)")
+                    elif c.type == "function_definition":
+                        decl = c.child_by_field_name("declarator")
+                        if decl:
+                            fid = decl.child_by_field_name("name")
+                            if not fid:
+                                for gc in decl.children:
+                                    if gc.type == "field_identifier":
+                                        fid = gc
+                                        break
+                            if fid:
+                                mname = fid.text.decode()
+                                param_list = decl.child_by_field_name("parameters")
+                                sig = param_list.text.decode("utf8", errors="ignore")[:40] if param_list else ""
+                                methods.append(f"{access}: {mname}{sig}")
+                    elif c.type == "field_declaration":
+                        txt = c.text.decode("utf8", errors="ignore").strip()
+                        # Check if it's a method declaration (has parentheses)
+                        if "(" in txt and txt.split("(")[0].strip().split()[-1]:
+                            mname = txt.split("(")[0].strip().split()[-1]
+                            sig = "(" + txt.split("(")[1][:40]
+                            methods.append(f"{access}: {mname}{sig}")
+                        else:
+                            # Member variable
+                            parts = txt.split()
+                            if parts and parts[-1] not in ("override", "= 0", "final"):
+                                fname = parts[-1].rstrip(";=,")
+                                if fname and not fname.startswith("//"):
+                                    fields.append(fname)
+                result = []
+                if methods:
+                    result.append("Methods: " + ", ".join(methods[:8]))
+                if fields:
+                    result.append("Fields: " + ", ".join(fields[:6]))
+                return ". ".join(result) if result else ""
+
+            def _ts_nl_description(name, node, bases_str):
+                if node.type not in ("class_specifier", "struct_specifier"):
+                    return ""
+                body = None
+                for c in node.children:
+                    if c.type == "field_declaration_list":
+                        body = c
+                        break
+                if not body:
+                    return ""
+
+                # Extract meaningful subwords from class name for enrichment
+                # Split class name into subwords (handle CamelCase and snake_case)
+                import re
+                subwords = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', name)
+                # Also split by underscore if present
+                if '_' in name:
+                    subwords = [word for subword in subwords for word in subword.split('_')]
+                subwords = [sw.lower() for sw in subwords if sw]
+
+                # Build fluent description using subwords from class name
+                base_name = ""
+                if bases_str:
+                    base_name = bases_str.replace(": ", "").replace("public ", "").strip()
+                    # Take first base only
+                    base_name = base_name.split(",")[0].strip().split()[-1] if base_name.split() else ""
+
+                desc_parts = []
+                
+                # Add class name with its meaningful subwords for enrichment
+                if subwords:
+                    # Filter out very generic words that don't add much meaning
+                    meaningful_subwords = [sw for sw in subwords if sw not in {'base', 'abstract', 'interface', 'impl', 'default', 'simple', 'basic'}]
+                    if meaningful_subwords:
+                        desc_parts.append(f"{name} ({' '.join(meaningful_subwords)})")
+                    else:
+                        desc_parts.append(f"{name}")
+                else:
+                    desc_parts.append(f"{name}")
+
+                # Add inheritance info if available
+                if base_name:
+                    desc_parts.append(f"extending {base_name}")
+
+                desc = " ".join(desc_parts) + "."
+                return f"Description: {desc}"
+
+            def _ts_template_params(n):
+                for c in n.children:
+                    if c.type == "template_parameter_list":
+                        return c.text.decode("utf8", errors="ignore")
+                return ""
+
+            def _ts_decl_name(n):
+                for c in n.children:
+                    if c.type == "identifier":
+                        return c.text.decode("utf8", errors="ignore")
+                    if c.type in ("reference_declarator", "pointer_declarator", "declarator", "function_declarator"):
+                        result = _ts_decl_name(c)
+                        if result:
+                            return result
+                return ""
+
+            def _ts_func_name(n):
+                decl = n.child_by_field_name("declarator")
+                if not decl:
+                    return _ts_decl_name(n)
+                return _ts_decl_name(decl)
+
+            def walk(node, class_name=""):
                 if node.type in cls._CPP_SIGNIFICANT:
                     name_node = node.child_by_field_name("name")
                     name = name_node.text.decode("utf8", errors="ignore") if name_node else ""
+                    if not name:
+                        if node.type == "declaration":
+                            name = _ts_decl_name(node)
+                        elif node.type in ("function_definition", "template_function", "template_method"):
+                            name = _ts_func_name(node)
                     doc = ""
                     for c in node.children:
                         if c.type == "comment":
@@ -380,26 +557,58 @@ class ASTParser:
                             break
                     if name:
                         params = node.child_by_field_name("parameters")
+                        if not params and node.type in ("function_definition", "template_function", "template_method"):
+                            decl = node.child_by_field_name("declarator")
+                            if decl:
+                                params = decl.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
-                        # Build text in the same format as tree parser
-                        label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
-                        text = f"{label} {path_hint} {node.type} {name}"
+
+                        extra = []
+                        # Template params
+                        tpl = _ts_template_params(node)
+                        if tpl:
+                            extra.append(f"template {tpl}")
+                        # Base classes for class/struct
+                        bases = _ts_base_classes(node) if node.type in ("class_specifier", "struct_specifier") else ""
+                        if bases:
+                            extra.append(bases)
+                        # Body summary
+                        body = _ts_body_summary(node)
+                        if body:
+                            extra.append(f"{{ {body} }}")
+                        # NL description
+                        nl_desc = _ts_nl_description(name, node, bases)
+                        if nl_desc:
+                            extra.append(nl_desc)
+
+                        # Natural language text for embedding
+                        label = _LABELS["mapping"].get(node.type, node.type)
+                        text = f"{label} {path_hint} {name}"
+                        if class_name and node.type in ("function_definition", "template_function", "template_method"):
+                            text += f" (in {class_name})"
+                        if extra:
+                            text += ". " + ". ".join(extra)
                         if sig_text:
-                            text += f" ({sig_text})"
+                            text += f". Signature: {sig_text}"
                         if doc:
-                            text += f" | {doc.strip()}"
+                            text += f". Doc: {doc.strip()}"
                         chunks.append(text)
+                next_class = class_name
+                if node.type in ("class_specifier", "struct_specifier"):
+                    nname = node.child_by_field_name("name")
+                    if nname:
+                        next_class = nname.text.decode("utf8", errors="ignore")
                 for c in node.children:
-                    walk(c)
+                    walk(c, next_class)
             walk(root)
         except Exception as e:
-            chunks.append(f"[FILE] {path_hint} (parse error: {e})")
-        return chunks if chunks else cls._parse_fallback(source, path_hint)
+            chunks.append(f"[file] {path_hint} (parse error: {e})")
+        return chunks if chunks else cls._parse_fallback(source, path_hint, "Block")
 
     @classmethod
     def _parse_cpp_clang(cls, source: str, path_hint: str = "") -> list[str]:
         if not _CLANG_AVAILABLE:
-            return cls._parse_fallback(source, path_hint)
+            return cls._parse_fallback(source, path_hint, "Block")
         try:
             import clang.cindex as ci
             # Try to set the library path to common locations
@@ -416,9 +625,9 @@ class ASTParser:
             if tu.diagnostics:
                 for diag in tu.diagnostics:
                     if diag.severity >= ci.Diagnostic.Error:
-                        return cls._parse_fallback(source, path_hint)
+                        return cls._parse_fallback(source, path_hint, "Block")
         except Exception:
-            return cls._parse_fallback(source, path_hint)
+            return cls._parse_fallback(source, path_hint, "Block")
 
         chunks: list[str] = []
         try:
@@ -447,34 +656,62 @@ class ASTParser:
                             signature = f"({', '.join(arg_types)})"
                         except Exception:
                             signature = ""
-                    # Build text in the same format as tree parser
+                    # Get base classes for class/struct
+                    extra = []
+                    if cursor.kind in (ci.CursorKind.CLASS_DECL, ci.CursorKind.STRUCT_DECL):
+                        bases = []
+                        for c in cursor.get_children():
+                            if c.kind == ci.CursorKind.CXX_BASE_SPECIFIER:
+                                try:
+                                    bases.append(c.type.spelling)
+                                except Exception:
+                                    pass
+                        if bases:
+                            extra.append(": public " + ", public ".join(bases))
+
+                    # Get body summary: first few member names
+                    if cursor.kind in (ci.CursorKind.CLASS_DECL, ci.CursorKind.STRUCT_DECL):
+                        members = []
+                        for c in cursor.get_children():
+                            if c.kind in (ci.CursorKind.FIELD_DECL, ci.CursorKind.CXX_METHOD):
+                                members.append(c.spelling)
+                                if len(members) >= 5:
+                                    break
+                        if members:
+                            extra.append(f"{{ {', '.join(members)} }}")
+
+                    # Natural language text for embedding
+                    kind_map = {"class_decl": "Class", "struct_decl": "Struct", "function_decl": "Function",
+                                "enum_decl": "Enum", "typedef_decl": "Type", "type_alias_decl": "Alias"}
                     type_key = cursor.kind.name.lower().replace('_decl', '')
-                    label = _LABELS["mapping"].get(type_key, f"[{type_key}]")
-                    text = f"{label} {path_hint} {type_key} {name}"
+                    human_kind = kind_map.get(cursor.kind.name.lower(), cursor.kind.name.lower())
+                    text = f"{human_kind} {name} in {path_hint}"
+                    if extra:
+                        text += ". " + ". ".join(extra)
                     if signature:
-                        text += f" ({signature})"
+                        text += f". Signature: {signature}"
                     if doc:
-                        text += f" | {doc}"
+                        text += f". Doc: {doc}"
                     chunks.append(text)
                 # Recurse
                 for child in cursor.get_children():
                     walk(child)
             walk(tu.cursor)
         except Exception as e:
-            chunks.append(f"[FILE] {path_hint} (clang parse error: {e})")
-        return chunks if chunks else cls._parse_fallback(source, path_hint)
+            chunks.append(f"[file] {path_hint} (clang parse error: {e})")
+        return chunks
 
     # --- Tree-sitter based handler (JS / Go / Rust) ---
 
     @classmethod
     def _parse_treesitter(cls, source: str, path_hint: str = "") -> list[str]:
         if not _TS_AVAILABLE:
-            return cls._parse_fallback(source, path_hint)
+            return []
 
         ext = os.path.splitext(path_hint)[1].lower()
         lang_config = _TS_LANGUAGES.get(ext)
         if not lang_config:
-            return cls._parse_fallback(source, path_hint)
+            return []
 
         lang_name, lang_fn = lang_config
         significant = _TS_SIGNIFICANT.get(lang_name, set())
@@ -499,7 +736,7 @@ class ASTParser:
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
                         # Build text in the same format as tree parser
                         label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
-                        text = f"{label} {path_hint} {node.type} {name}"
+                        text = f"{label} {path_hint} {name}"
                         if sig_text:
                             text += f" ({sig_text})"
                         if doc:
@@ -509,8 +746,8 @@ class ASTParser:
                     walk(c)
             walk(root)
         except Exception as e:
-            chunks.append(f"[FILE] {path_hint} (parse error: {e})")
-        return chunks if chunks else cls._parse_fallback(source, path_hint)
+            chunks.append(f"[file] {path_hint} (parse error: {e})")
+        return chunks
 
 
 # Register default handlers
@@ -535,6 +772,7 @@ class EmbeddingModel:
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = None):
         self.model = SentenceTransformer(model_name, device=device)
+        self.model.max_seq_length = 512
         self.dim = self.model.get_embedding_dimension()
 
     def embed(self, text: str) -> np.ndarray:
@@ -564,13 +802,13 @@ class VectorStore:
         self.texts.extend(texts)
 
     def search(self, query_vec: np.ndarray, top_k: int = 5) -> list[dict]:
-        """Return top_k nearest items as [{text, score}]."""
+        """Return top_k nearest items as [{text, score, idx}]."""
         if not self.vectors:
             return []
         scores = np.dot(np.stack(self.vectors), query_vec)
         top_idxs = np.argsort(scores)[-top_k:][::-1]
         return [
-            {"text": self.texts[i], "score": float(scores[i])}
+            {"text": self.texts[i], "score": float(scores[i]), "idx": i}
             for i in top_idxs
         ]
 
@@ -664,10 +902,10 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
             try:
                 file_chunks = ASTParser.parse_file(abspath, path_hint=fp)
                 if file_chunks:
-                    chunks.append(f"[FILE] {fp}")
+                    chunks.append(f"[file] {fp}")
                     chunks.extend(file_chunks)
             except Exception as e:
-                chunks.append(f"[FILE] {fp} (read error: {e})")
+                chunks.append(f"[file] {fp} (read error: {e})")
 
         if not chunks:
             print("Delta: no parseable chunks")
