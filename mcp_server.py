@@ -76,9 +76,18 @@ class EmbedderApp:
         self._delta_count = 0
         return "Delta cleared"
 
+    def _get_tree(self):
+        if not hasattr(self, "_tree"):
+            self._tree = TreeIndex(data_dir=self.data_dir)
+        return self._tree
+
+    def _annotate(self, hits: list[dict]) -> list[dict]:
+        return self._get_tree().annotate(hits)
+
     def search(self, query: str, top_k: int = 5) -> list[dict]:
         qv = self.encoder.embed(query)
-        return self.store.search(qv, top_k=top_k)
+        hits = self.store.search(qv, top_k=top_k)
+        return self._annotate(hits)
 
     def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5) -> list[dict]:
         if self._bm25 is None:
@@ -92,10 +101,12 @@ class EmbedderApp:
         emb_idx = {h["idx"] for h in emb_hits}
 
         if alpha >= 1.0:
-            return [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
+            hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
+            return self._annotate(hits)
         if alpha <= 0.0:
-            return [{"text": self.store.texts[i], "score": float(bm25_scores[i]), "idx": i, "method": "bm25"}
+            hits = [{"text": self.store.texts[i], "score": float(bm25_scores[i]), "idx": i, "method": "bm25"}
                     for i in bm25_top[:top_k]]
+            return self._annotate(hits)
 
         # RRF fusion
         K = 30
@@ -112,11 +123,12 @@ class EmbedderApp:
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
         scored = [(doc_id, rrf(doc_id)) for doc_id in candidates]
         scored.sort(key=lambda x: -x[1])
-        return [
+        hits = [
             {"text": self.store.texts[idx], "score": round(s, 4), "idx": idx,
              "method": "hybrid"}
             for idx, s in scored[:top_k]
         ]
+        return self._annotate(hits)
 
     def embed(self, text: str) -> list[float]:
         return self.encoder.embed(text).tolist()
@@ -146,17 +158,10 @@ class EmbedderApp:
         return json.dumps({"vectors": n, "delta": delta, "sample_texts": sample}, ensure_ascii=False)
 
     def tree_search(self, query: str, top_k: int = 5) -> str:
-        if not hasattr(self, "_tree"):
-            self._tree = TreeIndex(data_dir=self.data_dir)
-        qv = self.encoder.embed(query)
-        hits = self.store.search(qv, top_k=top_k)
-        return json.dumps(self._tree.annotate(hits), ensure_ascii=False, default=str)
+        return json.dumps(self.search(query, top_k=top_k), ensure_ascii=False, default=str)
 
     def tree_hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5) -> str:
-        if not hasattr(self, "_tree"):
-            self._tree = TreeIndex(data_dir=self.data_dir)
-        hits = self.hybrid_search(query, top_k=top_k, alpha=alpha)
-        return json.dumps(self._tree.annotate(hits), ensure_ascii=False, default=str)
+        return json.dumps(self.hybrid_search(query, top_k=top_k, alpha=alpha), ensure_ascii=False, default=str)
 
 
 projects: dict[str, EmbedderApp] = {}
@@ -165,7 +170,7 @@ mcp = FastMCP("embedder")
 
 @mcp.tool()
 def search(query: str, project: str, top_k: int = 5) -> str:
-    """Search documents by semantic similarity."""
+    """Search documents by semantic similarity, includes AST context (children/parent/siblings)."""
     global projects
     if not projects:
         return "Error: server not initialized"
@@ -177,7 +182,7 @@ def search(query: str, project: str, top_k: int = 5) -> str:
 
 @mcp.tool()
 def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5) -> str:
-    """Search by hybrid BM25 + embedding (alpha=1: pure embed, alpha=0: pure BM25)."""
+    """Search by hybrid BM25 + embedding (alpha=1: pure embed, alpha=0: pure BM25), includes AST context."""
     global projects
     if not projects:
         return "Error: server not initialized"
@@ -293,18 +298,6 @@ def save_store(path: str, project: str) -> str:
     if target_app is None:
         return f"Error: project '{project}' not found"
     return target_app.save(path)
-
-
-@mcp.tool()
-def tree_search(query: str, project: str, top_k: int = 5) -> str:
-    """Search with AST context (children/parent/siblings)."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.tree_search(query, top_k)
 
 
 @mcp.tool()
