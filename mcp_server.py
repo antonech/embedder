@@ -137,7 +137,7 @@ class EmbedderApp:
                     for i in bm25_top[:top_k]]
             return self._format(self._annotate(hits), fmt)
 
-        K = 30
+        K = 5
         def rrf(doc_id):
             emb_rank = next((r for r, h in enumerate(emb_hits) if h["idx"] == doc_id), None)
             bm25_rank = next((r for r, i in enumerate(bm25_top) if i == doc_id), None)
