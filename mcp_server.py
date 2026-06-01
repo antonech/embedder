@@ -98,14 +98,15 @@ class EmbedderApp:
                     for i in bm25_top[:top_k]]
 
         # RRF fusion
+        K = 30
         def rrf(doc_id):
             emb_rank = next((r for r, h in enumerate(emb_hits) if h["idx"] == doc_id), None)
             bm25_rank = next((r for r, i in enumerate(bm25_top) if i == doc_id), None)
             s = 0
             if emb_rank is not None:
-                s += alpha / (60 + emb_rank)
+                s += alpha / (K + emb_rank)
             if bm25_rank is not None:
-                s += (1 - alpha) / (60 + bm25_rank)
+                s += (1 - alpha) / (K + bm25_rank)
             return s
 
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)

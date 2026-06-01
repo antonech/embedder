@@ -772,7 +772,16 @@ class EmbeddingModel:
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = None):
         self.model = SentenceTransformer(model_name, device=device)
-        self.model.max_seq_length = 512
+
+        target = 512
+        try:
+            arch_max = self.model._first_module().auto_model.config.max_position_embeddings
+            target = min(target, arch_max)
+        except Exception:
+            pass
+
+        self.model.max_seq_length = target
+        self.model.tokenizer.model_max_length = target
         self.dim = self.model.get_embedding_dimension()
 
     def embed(self, text: str) -> np.ndarray:
@@ -849,12 +858,13 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
                   If not given, computed from config embedding_store + project name.
         delta: If True, build delta index (only changed files).
     """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    embedder_cfg_path = os.path.join(script_dir, "config.json")
+
     # Compute data_dir from embedder config if not explicitly given
     if data_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        embedder_cfg = os.path.join(script_dir, "config.json")
-        if os.path.exists(embedder_cfg):
-            with open(embedder_cfg) as f:
+        if os.path.exists(embedder_cfg_path):
+            with open(embedder_cfg_path) as f:
                 ecfg = json.load(f)
             store_root = ecfg.get("embedding_store")
             if store_root:
@@ -863,15 +873,20 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
     if not data_dir:
         data_dir = "data"
 
-    # Load project configuration
-    cfg_path = os.path.join(root, "config.json")
+    # Load model configuration — project root overrides, else fall back to embedder config
     model_name = "all-MiniLM-L6-v2"
     device = None
+    cfg_path = os.path.join(root, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             cfg = json.load(f)
         model_name = cfg.get("model_name", model_name)
         device = cfg.get("device")
+    elif os.path.exists(embedder_cfg_path):
+        with open(embedder_cfg_path) as f:
+            ecfg = json.load(f)
+        model_name = ecfg.get("model_name", model_name)
+        device = ecfg.get("device")
 
     # Initialize model and store
     enc = EmbeddingModel(model_name, device=device)
