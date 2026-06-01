@@ -34,11 +34,14 @@ class TreeIndex:
         if not m:
             return None
         file = m.group(1)
-        name = m.group(2)
+        name = m.group(2).rstrip(".,;:!?(){}[]")
         uid = self.lookup.get((file, name))
         if uid is not None:
             return self.nodes.get(uid)
         return None
+
+    def get_node(self, node_id: int) -> dict | None:
+        return self.nodes.get(node_id)
 
     def annotate(self, hits: list[dict]) -> list[dict]:
         for h in hits:

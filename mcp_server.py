@@ -48,10 +48,11 @@ class EmbedderApp:
         self._bm25 = BM25Okapi(corpus)
 
     def init(self, data_path: str) -> str:
-        vecs, texts, dim = StorageIO.load(data_path)
+        vecs, texts, dim, node_ids = StorageIO.load(data_path)
         self.store = VectorStore()
         self.store.vectors = vecs
         self.store.texts = texts
+        self.store.node_ids = node_ids if node_ids is not None else [None] * len(texts)
         self._delta_count = 0
         self.data_dir = os.path.dirname(data_path)
         if hasattr(self, "_tree"):
@@ -82,7 +83,32 @@ class EmbedderApp:
         return self._tree
 
     def _annotate(self, hits: list[dict]) -> list[dict]:
-        return self._get_tree().annotate(hits)
+        tree = self._get_tree()
+        for h in hits:
+            nid = h.get("node_id")
+            if nid is not None:
+                n = tree.get_node(nid)
+            else:
+                n = tree.match_node(h.get("text", ""))
+            if not n:
+                continue
+            uid = n["_uid"]
+            h["context"] = {
+                "children": [
+                    {"name": c["name"], "type": c["type"], "file": c["file"],
+                     "lines": f"{c['start_line']}-{c['end_line']}"}
+                    for c in tree.get_children(uid)
+                ],
+                "parent": None,
+                "siblings": [
+                    {"name": s["name"], "type": s["type"]}
+                    for s in tree.get_siblings(uid)
+                ],
+            }
+            p = tree.get_parent(uid)
+            if p:
+                h["context"]["parent"] = {"name": p["name"], "type": p["type"]}
+        return hits
 
     @staticmethod
     def _format(hits: list[dict], fmt: str = "text") -> str:

@@ -311,7 +311,7 @@ class ASTParser:
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
                     doc = ast.get_docstring(node) or ""
-                    chunk = f"Class {node.name} in {path_hint}"
+                    chunk = f"Class {path_hint} {node.name}"
                     if node.bases:
                         bases = [b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else str(b)) for b in node.bases]
                         chunk += f". Inherits: {', '.join(bases)}"
@@ -336,7 +336,7 @@ class ASTParser:
                         subwords = [word for subword in subwords for word in subword.split('_')]
                     subwords = [sw.lower() for sw in subwords if sw]
                     
-                    chunk = f"Function {node.name} in {path_hint}"
+                    chunk = f"Function {path_hint} {node.name}"
                     if len(subwords) > 1:
                         chunk += f" ({' '.join(subwords)})"
                     chunk += f". Args: ({', '.join(args)})"
@@ -799,25 +799,32 @@ class VectorStore:
     def __init__(self):
         self.vectors: list[np.ndarray] = []
         self.texts: list[str] = []
+        self.node_ids: list[int | None] = []
 
-    def add(self, vec: np.ndarray, text: str) -> None:
+    def add(self, vec: np.ndarray, text: str, node_id: int | None = None) -> None:
         """Add one vector-text pair."""
         self.vectors.append(vec)
         self.texts.append(text)
+        self.node_ids.append(node_id)
 
-    def add_many(self, vecs: np.ndarray, texts: list[str]) -> None:
+    def add_many(self, vecs: np.ndarray, texts: list[str], node_ids: list[int | None] | None = None) -> None:
         """Add multiple vector-text pairs."""
         self.vectors.extend(vecs)
         self.texts.extend(texts)
+        if node_ids is not None:
+            self.node_ids.extend(node_ids)
+        else:
+            self.node_ids.extend([None] * len(texts))
 
     def search(self, query_vec: np.ndarray, top_k: int = 5) -> list[dict]:
-        """Return top_k nearest items as [{text, score, idx}]."""
+        """Return top_k nearest items as [{text, score, idx, node_id}]."""
         if not self.vectors:
             return []
         scores = np.dot(np.stack(self.vectors), query_vec)
         top_idxs = np.argsort(scores)[-top_k:][::-1]
         return [
-            {"text": self.texts[i], "score": float(scores[i]), "idx": i}
+            {"text": self.texts[i], "score": float(scores[i]), "idx": i,
+             "node_id": self.node_ids[i] if i < len(self.node_ids) else None}
             for i in top_idxs
         ]
 
@@ -826,27 +833,35 @@ class VectorStore:
 
 
 class StorageIO:
-    """Save/load vectors, texts and dimension to/from .npz files."""
+    """Save/load vectors, texts, node_ids and dimension to/from .npz files."""
 
     @staticmethod
-    def save(path: str, vectors: list[np.ndarray], texts: list[str], dim: int) -> None:
-        """Persist vectors, texts and dimension to a compressed .npz file."""
-        np.savez_compressed(
-            path,
-            dim=np.array(dim),
-            vectors=np.stack(vectors) if vectors else np.array([]),
-            texts=np.array(texts, dtype=object),
-        )
+    def save(path: str, vectors: list[np.ndarray], texts: list[str], dim: int,
+             node_ids: list[int | None] | None = None) -> None:
+        data = {
+            "dim": np.array(dim),
+            "vectors": np.stack(vectors) if vectors else np.array([]),
+            "texts": np.array(texts, dtype=object),
+        }
+        if node_ids is not None:
+            data["node_ids"] = np.array(
+                [nid if nid is not None else -1 for nid in node_ids], dtype=np.int32
+            )
+        np.savez_compressed(path, **data)
 
     @staticmethod
-    def load(path: str) -> tuple[list[np.ndarray], list[str], int]:
-        """Load vectors, texts and dimension from a .npz file."""
+    def load(path: str) -> tuple:
+        """Load vectors, texts, node_ids and dimension from a .npz file."""
         data = np.load(path, allow_pickle=True)
         vecs = data["vectors"]
         vectors = [vecs[i] for i in range(len(vecs))]
         texts = list(data["texts"])
         dim = int(data["dim"])
-        return vectors, texts, dim
+        node_ids = None
+        if "node_ids" in data:
+            raw = data["node_ids"]
+            node_ids = [int(x) if x >= 0 else None for x in raw]
+        return vectors, texts, dim, node_ids
 
 
 def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False) -> None:
@@ -948,12 +963,40 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
     else:
         # --- Full rebuild ---
         chunks = ASTParser.scan_project(project)
+
+        # Enrich chunks with tree context and build node_ids mapping
+        node_ids = [None] * len(chunks)
+        tree_index_path = os.path.join(data_dir, "tree_index.json")
+        if os.path.exists(tree_index_path):
+            try:
+                from tree_search import TreeIndex
+                ti = TreeIndex(data_dir=data_dir)
+                for i, text in enumerate(chunks):
+                    n = ti.match_node(text)
+                    if n is None:
+                        continue
+                    uid = n["_uid"]
+                    node_ids[i] = uid
+                    # Append parent context to chunk text
+                    parent = ti.get_parent(uid)
+                    if parent:
+                        chunks[i] += f". Parent: {parent['name']}"
+                    # Append children context
+                    kids = ti.get_children(uid)
+                    if kids:
+                        child_names = [c["name"] for c in kids[:6]]
+                        chunks[i] += f". Children: {', '.join(child_names)}"
+                matched = sum(1 for n in node_ids if n is not None)
+                print(f"  enriched {matched}/{len(chunks)} chunks with tree context")
+            except Exception as e:
+                print(f"  tree enrichment skipped: {e}")
+
         vecs = enc.embed_many(chunks)
         store.add_many(vecs, chunks)
 
         out = os.path.join(project, data_dir, 'enriched_vectors.npz')
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        StorageIO.save(out, store.vectors, store.texts, enc.dim)
+        StorageIO.save(out, store.vectors, store.texts, enc.dim, node_ids=node_ids)
         print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 

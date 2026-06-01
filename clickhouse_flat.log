@@ -1,0 +1,10 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 8103.49it/s]
+<unknown>:244: SyntaxWarning: invalid escape sequence '\.'
+<unknown>:109: SyntaxWarning: invalid escape sequence '\{'
+<unknown>:113: SyntaxWarning: invalid escape sequence '\['
+<unknown>:96: SyntaxWarning: invalid escape sequence '\d'
+<unknown>:96: SyntaxWarning: invalid escape sequence '\d'
+<unknown>:597: SyntaxWarning: invalid escape sequence '\/'
+<unknown>:1522: SyntaxWarning: invalid escape sequence '\('
+Flat index: 378533 chunks -> /home/anton/project/embedder_store/clickhouse/enriched_vectors.npz
