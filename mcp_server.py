@@ -84,14 +84,40 @@ class EmbedderApp:
     def _annotate(self, hits: list[dict]) -> list[dict]:
         return self._get_tree().annotate(hits)
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
+    @staticmethod
+    def _format(hits: list[dict], fmt: str = "json") -> str:
+        if fmt == "json":
+            return json.dumps(hits, ensure_ascii=False, default=str)
+        lines = []
+        for i, h in enumerate(hits, 1):
+            ctx = h.get("context")
+            if ctx:
+                parent = ctx.get("parent")
+                parent_str = f"{parent['name']} ({parent['type']})" if parent else "—"
+                children_str = ", ".join(c["name"] for c in ctx.get("children", [])[:5])
+                if len(ctx.get("children", [])) > 5:
+                    children_str += "..."
+                siblings_str = ", ".join(s["name"] for s in ctx.get("siblings", [])[:5])
+                if len(ctx.get("siblings", [])) > 5:
+                    siblings_str += "..."
+            lines.append(f"### {i}. [{h['score']:.3f}] {h['text'][:200]}")
+            if ctx:
+                lines.append(f"  **Parent:** {parent_str}")
+                if children_str:
+                    lines.append(f"  **Children:** {children_str}")
+                if siblings_str:
+                    lines.append(f"  **Siblings:** {siblings_str}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def search(self, query: str, top_k: int = 5, fmt: str = "json") -> str:
         qv = self.encoder.embed(query)
         hits = self.store.search(qv, top_k=top_k)
-        return self._annotate(hits)
+        return self._format(self._annotate(hits), fmt)
 
-    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5) -> list[dict]:
+    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "json") -> str:
         if self._bm25 is None:
-            return self.search(query, top_k=top_k)
+            return self.search(query, top_k=top_k, fmt=fmt)
         qv = self.encoder.embed(query)
         emb_hits = self.store.search(qv, top_k=top_k * 3)
         tokenized = self._tokenize(query)
@@ -102,13 +128,12 @@ class EmbedderApp:
 
         if alpha >= 1.0:
             hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
-            return self._annotate(hits)
+            return self._format(self._annotate(hits), fmt)
         if alpha <= 0.0:
             hits = [{"text": self.store.texts[i], "score": float(bm25_scores[i]), "idx": i, "method": "bm25"}
                     for i in bm25_top[:top_k]]
-            return self._annotate(hits)
+            return self._format(self._annotate(hits), fmt)
 
-        # RRF fusion
         K = 30
         def rrf(doc_id):
             emb_rank = next((r for r, h in enumerate(emb_hits) if h["idx"] == doc_id), None)
@@ -128,7 +153,7 @@ class EmbedderApp:
              "method": "hybrid"}
             for idx, s in scored[:top_k]
         ]
-        return self._annotate(hits)
+        return self._format(self._annotate(hits), fmt)
 
     def embed(self, text: str) -> list[float]:
         return self.encoder.embed(text).tolist()
@@ -158,10 +183,10 @@ class EmbedderApp:
         return json.dumps({"vectors": n, "delta": delta, "sample_texts": sample}, ensure_ascii=False)
 
     def tree_search(self, query: str, top_k: int = 5) -> str:
-        return json.dumps(self.search(query, top_k=top_k), ensure_ascii=False, default=str)
+        return self.search(query, top_k=top_k, fmt="json")
 
     def tree_hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5) -> str:
-        return json.dumps(self.hybrid_search(query, top_k=top_k, alpha=alpha), ensure_ascii=False, default=str)
+        return self.hybrid_search(query, top_k=top_k, alpha=alpha, fmt="json")
 
 
 projects: dict[str, EmbedderApp] = {}
@@ -169,7 +194,7 @@ mcp = FastMCP("embedder")
 
 
 @mcp.tool()
-def search(query: str, project: str, top_k: int = 5) -> str:
+def search(query: str, project: str, top_k: int = 5, fmt: str = "markdown") -> str:
     """Search documents by semantic similarity, includes AST context (children/parent/siblings)."""
     global projects
     if not projects:
@@ -177,11 +202,11 @@ def search(query: str, project: str, top_k: int = 5) -> str:
     target_app = projects.get(project)
     if target_app is None:
         return f"Error: project '{project}' not found"
-    return json.dumps(target_app.search(query, top_k), ensure_ascii=False, default=str)
+    return target_app.search(query, top_k=top_k, fmt=fmt)
 
 
 @mcp.tool()
-def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5) -> str:
+def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "markdown") -> str:
     """Search by hybrid BM25 + embedding (alpha=1: pure embed, alpha=0: pure BM25), includes AST context."""
     global projects
     if not projects:
@@ -189,7 +214,7 @@ def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5) 
     target_app = projects.get(project)
     if target_app is None:
         return f"Error: project '{project}' not found"
-    return json.dumps(target_app.hybrid_search(query, top_k, alpha), ensure_ascii=False, default=str)
+    return target_app.hybrid_search(query, top_k=top_k, alpha=alpha, fmt=fmt)
 
 
 @mcp.tool()
@@ -241,8 +266,8 @@ def init_store(data_path: str, project: str) -> str:
 
 
 @mcp.tool()
-def tree_search(query: str, project: str, top_k: int = 5) -> str:
-    """Search with AST context (children/parent/siblings)."""
+def tree_search(query: str, project: str, top_k: int = 5, fmt: str = "json") -> str:
+    """Alias for search (json format)."""
     global projects
     if not projects:
         return "Error: server not initialized"
@@ -253,8 +278,8 @@ def tree_search(query: str, project: str, top_k: int = 5) -> str:
 
 
 @mcp.tool()
-def tree_hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5) -> str:
-    """Search with AST context using hybrid BM25 + embedding."""
+def tree_hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "json") -> str:
+    """Alias for hybrid_search (json format)."""
     global projects
     if not projects:
         return "Error: server not initialized"
