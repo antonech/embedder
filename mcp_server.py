@@ -264,15 +264,32 @@ class EmbedderApp:
         bm25_top = sorted(range(n), key=lambda i: bm25_raw[i], reverse=True)[:top_k * 3]
 
         if mode == "bm25":
-            hits = [{"text": self.store.texts[i], "score": float(bm25_raw[i]), "idx": i, "method": "bm25"}
-                    for i in bm25_top[:top_k]]
+            top_scores = [bm25_raw[i] for i in bm25_top[:top_k]]
+            min_b, max_b = min(top_scores), max(top_scores)
+            hits = [
+                {"text": self.store.texts[i],
+                 "score": (float(bm25_raw[i]) - min_b) / (max_b - min_b) if max_b > min_b else 0.5,
+                 "idx": i, "method": "bm25"}
+                for i in bm25_top[:top_k]
+            ]
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
             return self._format(self._annotate(hits), fmt)
 
         if alpha is None:
             alpha = 0.7
-        if alpha >= 1.0 or alpha <= 0.0:
+        if alpha >= 1.0:
             hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
+            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            return self._format(self._annotate(hits), fmt)
+        if alpha <= 0.0:
+            top_scores = [bm25_raw[i] for i in bm25_top[:top_k]]
+            min_b, max_b = min(top_scores), max(top_scores)
+            hits = [
+                {"text": self.store.texts[i],
+                 "score": (float(bm25_raw[i]) - min_b) / (max_b - min_b) if max_b > min_b else 0.5,
+                 "idx": i, "method": "bm25"}
+                for i in bm25_top[:top_k]
+            ]
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
             return self._format(self._annotate(hits), fmt)
 
