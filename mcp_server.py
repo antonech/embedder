@@ -118,38 +118,36 @@ class EmbedderApp:
         hits = self.store.search(qv, top_k=top_k)
         return self._format(self._annotate(hits), fmt)
 
-    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "text") -> str:
+    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.3, fmt: str = "text") -> str:
         if self._bm25 is None:
             return self.search(query, top_k=top_k, fmt=fmt)
         qv = self.encoder.embed(query)
         emb_hits = self.store.search(qv, top_k=top_k * 3)
         tokenized = self._tokenize(query)
         n = len(self.store)
-        bm25_scores = self._bm25.get_scores(tokenized)
-        bm25_top = sorted(range(n), key=lambda i: bm25_scores[i], reverse=True)[:top_k * 3]
-        emb_idx = {h["idx"] for h in emb_hits}
+        bm25_raw = self._bm25.get_scores(tokenized)
+        bm25_top = sorted(range(n), key=lambda i: bm25_raw[i], reverse=True)[:top_k * 3]
 
         if alpha >= 1.0:
             hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
             return self._format(self._annotate(hits), fmt)
         if alpha <= 0.0:
-            hits = [{"text": self.store.texts[i], "score": float(bm25_scores[i]), "idx": i, "method": "bm25"}
+            hits = [{"text": self.store.texts[i], "score": float(bm25_raw[i]), "idx": i, "method": "bm25"}
                     for i in bm25_top[:top_k]]
             return self._format(self._annotate(hits), fmt)
 
-        K = 5
-        def rrf(doc_id):
-            emb_rank = next((r for r, h in enumerate(emb_hits) if h["idx"] == doc_id), None)
-            bm25_rank = next((r for r, i in enumerate(bm25_top) if i == doc_id), None)
-            s = 0
-            if emb_rank is not None:
-                s += alpha / (K + emb_rank)
-            if bm25_rank is not None:
-                s += (1 - alpha) / (K + bm25_rank)
-            return s
-
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
-        scored = [(doc_id, rrf(doc_id)) for doc_id in candidates]
+
+        emb_scores = {h["idx"]: h["score"] for h in emb_hits}
+        cand_bm25 = {idx: bm25_raw[idx] for idx in candidates}
+        min_b, max_b = min(cand_bm25.values()), max(cand_bm25.values())
+
+        def blend(doc_id):
+            b = (cand_bm25[doc_id] - min_b) / (max_b - min_b) if max_b > min_b else 0.5
+            e = emb_scores.get(doc_id, 0.0)
+            return (1 - alpha) * b + alpha * e
+
+        scored = [(doc_id, blend(doc_id)) for doc_id in candidates]
         scored.sort(key=lambda x: -x[1])
         hits = [
             {"text": self.store.texts[idx], "score": round(s, 4), "idx": idx,
