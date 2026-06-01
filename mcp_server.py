@@ -85,37 +85,40 @@ class EmbedderApp:
         return self._get_tree().annotate(hits)
 
     @staticmethod
-    def _format(hits: list[dict], fmt: str = "json") -> str:
+    def _format(hits: list[dict], fmt: str = "text") -> str:
         if fmt == "json":
             return json.dumps(hits, ensure_ascii=False, default=str)
         lines = []
         for i, h in enumerate(hits, 1):
-            ctx = h.get("context")
-            if ctx:
-                parent = ctx.get("parent")
-                parent_str = f"{parent['name']} ({parent['type']})" if parent else "—"
-                children_str = ", ".join(c["name"] for c in ctx.get("children", [])[:5])
-                if len(ctx.get("children", [])) > 5:
-                    children_str += "..."
-                siblings_str = ", ".join(s["name"] for s in ctx.get("siblings", [])[:5])
-                if len(ctx.get("siblings", [])) > 5:
-                    siblings_str += "..."
-            lines.append(f"### {i}. [{h['score']:.3f}] {h['text'][:200]}")
-            if ctx:
-                lines.append(f"  **Parent:** {parent_str}")
-                if children_str:
-                    lines.append(f"  **Children:** {children_str}")
-                if siblings_str:
-                    lines.append(f"  **Siblings:** {siblings_str}")
+            if fmt == "markdown":
+                ctx = h.get("context")
+                if ctx:
+                    parent = ctx.get("parent")
+                    parent_str = f"{parent['name']} ({parent['type']})" if parent else "—"
+                    children_str = ", ".join(c["name"] for c in ctx.get("children", [])[:5])
+                    if len(ctx.get("children", [])) > 5:
+                        children_str += "..."
+                    siblings_str = ", ".join(s["name"] for s in ctx.get("siblings", [])[:5])
+                    if len(ctx.get("siblings", [])) > 5:
+                        siblings_str += "..."
+                lines.append(f"### {i}. [{h['score']:.3f}] {h['text'][:200]}")
+                if ctx:
+                    lines.append(f"  **Parent:** {parent_str}")
+                    if children_str:
+                        lines.append(f"  **Children:** {children_str}")
+                    if siblings_str:
+                        lines.append(f"  **Siblings:** {siblings_str}")
+            else:
+                lines.append(f"{i}. [{h['score']:.3f}] {h['text'][:200]}")
             lines.append("")
         return "\n".join(lines).strip()
 
-    def search(self, query: str, top_k: int = 5, fmt: str = "json") -> str:
+    def search(self, query: str, top_k: int = 5, fmt: str = "text") -> str:
         qv = self.encoder.embed(query)
         hits = self.store.search(qv, top_k=top_k)
         return self._format(self._annotate(hits), fmt)
 
-    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "json") -> str:
+    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "text") -> str:
         if self._bm25 is None:
             return self.search(query, top_k=top_k, fmt=fmt)
         qv = self.encoder.embed(query)
@@ -194,7 +197,7 @@ mcp = FastMCP("embedder")
 
 
 @mcp.tool()
-def search(query: str, project: str, top_k: int = 5, fmt: str = "markdown") -> str:
+def search(query: str, project: str, top_k: int = 5, fmt: str = "text") -> str:
     """Search documents by semantic similarity, includes AST context (children/parent/siblings)."""
     global projects
     if not projects:
@@ -206,7 +209,7 @@ def search(query: str, project: str, top_k: int = 5, fmt: str = "markdown") -> s
 
 
 @mcp.tool()
-def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "markdown") -> str:
+def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "text") -> str:
     """Search by hybrid BM25 + embedding (alpha=1: pure embed, alpha=0: pure BM25), includes AST context."""
     global projects
     if not projects:
