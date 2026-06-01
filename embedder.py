@@ -1110,12 +1110,16 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
     # Parallel file parsing
     all_tree_nodes = []
     chunks = []
+    tree_node_count = 0
     with mp.Pool(num_workers) as pool:
-        for tree_nodes, flat_chunks, _ in pool.imap_unordered(_parse_file_worker, file_list):
+        for i, (tree_nodes, flat_chunks, _) in enumerate(pool.imap_unordered(_parse_file_worker, file_list)):
             if tree_nodes:
                 all_tree_nodes.append(tree_nodes)
+                tree_node_count += len(tree_nodes)
             if flat_chunks:
                 chunks.extend(flat_chunks)
+            if (i + 1) % max(1, len(file_list) // 20) == 0 or i == len(file_list) - 1:
+                print(f"  [{i+1}/{len(file_list)}] files, {tree_node_count} tree nodes, {len(chunks)} chunks")
 
     # Renumber tree nodes: each file has local IDs starting at 0
     # Assign global sequential IDs and fix parent_id references
