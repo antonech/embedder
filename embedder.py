@@ -1107,11 +1107,12 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
 
     print(f"Parsing {len(file_list)} files with {num_workers} workers...")
 
-    # Parallel file parsing
+    # Parallel file parsing (spawn avoids fork deadlocks with tree-sitter C extensions)
+    ctx = mp.get_context("spawn")
     all_tree_nodes = []
     chunks = []
     tree_node_count = 0
-    with mp.Pool(num_workers) as pool:
+    with ctx.Pool(num_workers) as pool:
         for i, (tree_nodes, flat_chunks, _) in enumerate(pool.imap_unordered(_parse_file_worker, file_list)):
             if tree_nodes:
                 all_tree_nodes.append(tree_nodes)
