@@ -38,16 +38,11 @@ else
     PYTHON="python3"
 fi
 
-# --- Tree index via tree-sitter (build first so flat index can reference node_ids) ---
+# --- Combined build: tree index + flat index in a single file walk ---
 if [ "$DELTA" = false ]; then
-    $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT"
+    $PYTHON "$ME/embedder.py" --build-all --root "$PROJECT"
 else
+    # Delta: tree parser first (for context), then flat delta
     $PYTHON "$ME/tree_ast_parser.py" --root "$PROJECT" --delta
-fi
-
-# --- Flat index via embedder.py (data_dir computed from config + project name) ---
-if [ "$DELTA" = false ]; then
-    $PYTHON "$ME/embedder.py" --build-flat --root "$PROJECT"
-else
     $PYTHON "$ME/embedder.py" --build-flat --delta --root "$PROJECT"
 fi

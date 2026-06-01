@@ -1001,15 +1001,160 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 
+def build_all(root: str, data_dir: str | None = None, exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}) -> None:
+    """Build both tree and flat indices in a single file walk.
+
+    Eliminates redundant I/O: each source file is parsed once for both
+    tree nodes (functions, classes) and flat chunks (enriched code blocks).
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    embedder_cfg_path = os.path.join(script_dir, "config.json")
+
+    # Resolve data_dir
+    if data_dir is None:
+        if os.path.exists(embedder_cfg_path):
+            with open(embedder_cfg_path) as f:
+                ecfg = json.load(f)
+            store_root = ecfg.get("embedding_store")
+            if store_root:
+                store_root = os.path.expandvars(os.path.expanduser(store_root))
+                data_dir = os.path.join(store_root, os.path.basename(root))
+    if not data_dir:
+        data_dir = "data"
+
+    # Load model config
+    model_name = "all-MiniLM-L6-v2"
+    device = None
+    cfg_path = os.path.join(root, "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        model_name = cfg.get("model_name", model_name)
+        device = cfg.get("device")
+    elif os.path.exists(embedder_cfg_path):
+        with open(embedder_cfg_path) as f:
+            ecfg = json.load(f)
+        model_name = ecfg.get("model_name", model_name)
+        device = ecfg.get("device")
+
+    enc = EmbeddingModel(model_name, device=device)
+    flat_store = VectorStore()
+    tree_store = VectorStore()
+
+    # Import tree parser
+    from tree_ast_parser import parse_file as tree_parse_file, LANGUAGES as TREE_LANGS
+
+    # Load enrichment strategy for flat chunks
+    strategy = ASTParser._load_strategy(root)
+
+    all_tree_nodes = []
+    tree_texts = []
+    next_id = [0]
+    tree_exts = tuple(TREE_LANGS.keys())
+    chunks = []
+    file_count = 0
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ASTParser.SKIP_DIRS]
+        for fn in sorted(filenames):
+            fp = os.path.join(dirpath, fn)
+            rel = os.path.relpath(fp, root)
+            if any(x in fp for x in exclude):
+                continue
+
+            # Flat chunks (all supported files)
+            try:
+                file_chunks = ASTParser.parse_file(fp, path_hint=rel)
+                if file_chunks:
+                    for c in file_chunks:
+                        if isinstance(c, str):
+                            if c.startswith(tuple(ASTParser.SKIP_PREFIXES)):
+                                continue
+                            chunks.append(c)
+                        else:
+                            enriched = strategy.enrich(c)
+                            f = c.get("file")
+                            if f:
+                                enriched += f" ({f})"
+                            chunks.append(enriched)
+            except Exception:
+                pass
+
+            # Tree nodes (code languages only)
+            if fp.endswith(tree_exts):
+                try:
+                    nodes = tree_parse_file(fp, next_id=next_id, root=root)
+                    for n in nodes:
+                        all_tree_nodes.append(n)
+                        tree_texts.append(n["text"])
+                except Exception:
+                    pass
+
+            file_count += 1
+            if file_count % 1000 == 0:
+                print(f"  {file_count} files, {len(chunks)} chunks, {len(tree_texts)} tree nodes")
+
+    # Batch-embed tree texts
+    if tree_texts:
+        tree_vecs = enc.embed_many(tree_texts)
+        tree_store.add_many(tree_vecs, tree_texts)
+
+    # Save tree index
+    os.makedirs(data_dir, exist_ok=True)
+    tree_vec_path = os.path.join(data_dir, "tree_vectors.npz")
+    tree_json_path = os.path.join(data_dir, "tree_index.json")
+    if tree_store.vectors:
+        StorageIO.save(tree_vec_path, tree_store.vectors, tree_store.texts, enc.dim)
+        tree_data = {"nodes": all_tree_nodes, "texts": tree_store.texts}
+        with open(tree_json_path, "w", encoding="utf8") as f:
+            json.dump(tree_data, f, ensure_ascii=False, indent=2)
+        print(f"Tree index: {len(all_tree_nodes)} nodes -> {tree_vec_path} + {tree_json_path}")
+    else:
+        print("No tree nodes found")
+
+    # Enrich flat chunks with tree context and build node_ids
+    node_ids = [None] * len(chunks)
+    try:
+        from tree_search import TreeIndex
+        ti = TreeIndex(data_dir=data_dir)
+        for i, text in enumerate(chunks):
+            n = ti.match_node(text)
+            if n is None:
+                continue
+            uid = n["_uid"]
+            node_ids[i] = uid
+            parent = ti.get_parent(uid)
+            if parent:
+                chunks[i] += f". Parent: {parent['name']}"
+            kids = ti.get_children(uid)
+            if kids:
+                child_names = [c["name"] for c in kids[:6]]
+                chunks[i] += f". Children: {', '.join(child_names)}"
+        matched = sum(1 for n in node_ids if n is not None)
+        print(f"  enriched {matched}/{len(chunks)} chunks with tree context")
+    except Exception as e:
+        print(f"  tree enrichment skipped: {e}")
+
+    # Save flat index
+    vecs = enc.embed_many(chunks)
+    flat_store.add_many(vecs, chunks)
+    out = os.path.join(data_dir, "enriched_vectors.npz")
+    StorageIO.save(out, flat_store.vectors, flat_store.texts, enc.dim, node_ids=node_ids)
+    print(f"Flat index: {len(chunks)} chunks -> {out}")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Build flat vector index for a project.')
+    parser = argparse.ArgumentParser(description='Build vector index for a project.')
     parser.add_argument('--build-flat', action='store_true', help='Build the flat index')
+    parser.add_argument('--build-all', action='store_true', help='Build tree + flat index in one pass')
     parser.add_argument('--delta', action='store_true', help='Build delta index (only changed files)')
     parser.add_argument('--data-dir', default=None, help='Directory to save the index (default: from config)')
     parser.add_argument('--root', default='.', help='Project root directory')
     args = parser.parse_args()
 
-    if args.build_flat:
+    if args.build_all:
+        build_all(args.root, args.data_dir)
+    elif args.build_flat:
         build_flat_index(args.root, args.data_dir, args.delta)
     else:
         parser.error('Please specify --build-flat')
