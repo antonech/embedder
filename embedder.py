@@ -1001,11 +1001,59 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 
-def build_all(root: str, data_dir: str | None = None, exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}) -> None:
-    """Build both tree and flat indices in a single file walk.
+def _parse_file_worker(args):
+    """Worker function for parallel file parsing. Returns (tree_nodes, flat_chunks, rel_path)."""
+    fp, rel, root, tree_exts, exclude = args
+    if any(x in fp for x in exclude):
+        return [], [], rel
 
-    Eliminates redundant I/O: each source file is parsed once for both
-    tree nodes (functions, classes) and flat chunks (enriched code blocks).
+    tree_nodes = []
+    flat_chunks = []
+    strategy = ASTParser._load_strategy(root)
+
+    # Flat chunks (all supported files)
+    try:
+        file_chunks = ASTParser.parse_file(fp, path_hint=rel)
+        if file_chunks:
+            for c in file_chunks:
+                if isinstance(c, str):
+                    if c.startswith(tuple(ASTParser.SKIP_PREFIXES)):
+                        continue
+                    flat_chunks.append(c)
+                else:
+                    enriched = strategy.enrich(c)
+                    f = c.get("file")
+                    if f:
+                        enriched += f" ({f})"
+                    flat_chunks.append(enriched)
+    except Exception:
+        pass
+
+    # Tree nodes (code languages only)
+    if fp.endswith(tree_exts):
+        try:
+            from tree_ast_parser import parse_file as tree_parse_file
+            nodes = tree_parse_file(fp, root=root)
+            tree_nodes = nodes
+        except Exception:
+            pass
+
+    return tree_nodes, flat_chunks, rel
+
+
+def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
+              exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}) -> None:
+    """Build both tree and flat indices in a single parallel file walk.
+
+    Each source file is parsed once for both tree nodes and flat chunks,
+    then both indices are saved at the end. File parsing runs in parallel
+    via multiprocessing.Pool.
+
+    Args:
+        root: Project root directory.
+        data_dir: Directory to save the index (default: from config + project name).
+        num_workers: Number of parallel worker processes (default: 8).
+        exclude: Path substrings to skip.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     embedder_cfg_path = os.path.join(script_dir, "config.json")
@@ -1041,19 +1089,13 @@ def build_all(root: str, data_dir: str | None = None, exclude={"/venv/", "/__pyc
     flat_store = VectorStore()
     tree_store = VectorStore()
 
-    # Import tree parser
-    from tree_ast_parser import parse_file as tree_parse_file, LANGUAGES as TREE_LANGS
+    import multiprocessing as mp
+    from tree_ast_parser import LANGUAGES as TREE_LANGS
 
-    # Load enrichment strategy for flat chunks
-    strategy = ASTParser._load_strategy(root)
-
-    all_tree_nodes = []
-    tree_texts = []
-    next_id = [0]
     tree_exts = tuple(TREE_LANGS.keys())
-    chunks = []
-    file_count = 0
 
+    # Collect file list
+    file_list = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in ASTParser.SKIP_DIRS]
         for fn in sorted(filenames):
@@ -1061,38 +1103,37 @@ def build_all(root: str, data_dir: str | None = None, exclude={"/venv/", "/__pyc
             rel = os.path.relpath(fp, root)
             if any(x in fp for x in exclude):
                 continue
+            file_list.append((fp, rel, root, tree_exts, exclude))
 
-            # Flat chunks (all supported files)
-            try:
-                file_chunks = ASTParser.parse_file(fp, path_hint=rel)
-                if file_chunks:
-                    for c in file_chunks:
-                        if isinstance(c, str):
-                            if c.startswith(tuple(ASTParser.SKIP_PREFIXES)):
-                                continue
-                            chunks.append(c)
-                        else:
-                            enriched = strategy.enrich(c)
-                            f = c.get("file")
-                            if f:
-                                enriched += f" ({f})"
-                            chunks.append(enriched)
-            except Exception:
-                pass
+    print(f"Parsing {len(file_list)} files with {num_workers} workers...")
 
-            # Tree nodes (code languages only)
-            if fp.endswith(tree_exts):
-                try:
-                    nodes = tree_parse_file(fp, next_id=next_id, root=root)
-                    for n in nodes:
-                        all_tree_nodes.append(n)
-                        tree_texts.append(n["text"])
-                except Exception:
-                    pass
+    # Parallel file parsing
+    all_tree_nodes = []
+    chunks = []
+    with mp.Pool(num_workers) as pool:
+        for tree_nodes, flat_chunks, _ in pool.imap_unordered(_parse_file_worker, file_list):
+            if tree_nodes:
+                all_tree_nodes.append(tree_nodes)
+            if flat_chunks:
+                chunks.extend(flat_chunks)
 
-            file_count += 1
-            if file_count % 1000 == 0:
-                print(f"  {file_count} files, {len(chunks)} chunks, {len(tree_texts)} tree nodes")
+    # Renumber tree nodes: each file has local IDs starting at 0
+    # Assign global sequential IDs and fix parent_id references
+    tree_texts = []
+    global_id = 0
+    for file_nodes in all_tree_nodes:
+        old_to_new = {}
+        for n in file_nodes:
+            old_to_new[n["id"]] = global_id
+            n["id"] = global_id
+            global_id += 1
+        for n in file_nodes:
+            pid = n.get("parent_id", -1)
+            n["parent_id"] = old_to_new.get(pid, -1)
+        tree_texts.extend(n["text"] for n in file_nodes)
+
+    all_tree_nodes = [n for nodes in all_tree_nodes for n in nodes]
+    print(f"  parsed {len(all_tree_nodes)} tree nodes, {len(chunks)} flat chunks")
 
     # Batch-embed tree texts
     if tree_texts:

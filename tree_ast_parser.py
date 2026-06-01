@@ -73,7 +73,7 @@ def get_signature(node, source: bytes, lang: str) -> str:
     return ""
 
 
-def get_base_classes(node, source: bytes) -> str:
+def get_base_classes(node, source: bytes) -> tuple[list[str], str]:
     bases = []
     for child in node.children:
         if child.type == "base_class_clause":
@@ -81,8 +81,21 @@ def get_base_classes(node, source: bytes) -> str:
                 if cc.type == "type_identifier":
                     bases.append(cc.text.decode("utf8", errors="ignore"))
     if bases:
-        return ": " + ", ".join(bases)
-    return ""
+        return bases, ": " + ", ".join(bases)
+    return [], ""
+
+
+def get_includes(source: bytes, lang: str) -> list[str]:
+    includes = []
+    if lang in ("cpp", "h"):
+        text = source.decode("utf8", errors="ignore")
+        for line in text.splitlines():
+            ls = line.strip()
+            if ls.startswith("#include"):
+                inc = ls.split(None, 1)[-1].strip("\"<>")
+                if inc:
+                    includes.append(inc)
+    return includes
 
 
 def get_body_summary(node, source: bytes) -> str:
@@ -139,7 +152,7 @@ def get_template_params(node, source: bytes, lang: str) -> str:
     return ""
 
 
-def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None, root: str = "."):
+def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, parent_id: int = -1, next_id: list | None = None, root: str = ".", file_includes: list | None = None):
     rel_filepath = os.path.relpath(filepath, root)
     if next_id is None:
         next_id = [0]
@@ -160,10 +173,11 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
                 extra_parts.append(f"template {tpl}")
 
             # Base classes for class/struct
+            bases_list = []
             if node.type in ("class_specifier", "struct_specifier"):
-                bases = get_base_classes(node, source)
-                if bases:
-                    extra_parts.append(bases)
+                bases_list, bases_text = get_base_classes(node, source)
+                if bases_text:
+                    extra_parts.append(bases_text)
 
             # Body summary
             body = get_body_summary(node, source)
@@ -180,7 +194,7 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
                 doc_short = doc.strip().replace("\n", " ")[:200]
                 text += f". Doc: {doc_short}"
 
-            nodes.append({
+            entry = {
                 "id": node_id,
                 "parent_id": parent_id,
                 "type": node.type,
@@ -191,11 +205,16 @@ def collect_nodes(node, source: bytes, filepath: str, lang: str, nodes: list, pa
                 "signature": sig,
                 "docstring": doc,
                 "text": text,
-            })
+            }
+            if bases_list:
+                entry["bases"] = bases_list
+            if file_includes:
+                entry["includes"] = file_includes
+            nodes.append(entry)
             parent_id = node_id
 
     for child in node.children:
-        collect_nodes(child, source, filepath, lang, nodes, parent_id, next_id)
+        collect_nodes(child, source, filepath, lang, nodes, parent_id, next_id, root, file_includes)
 
 
 def parse_file(filepath: str, next_id: list | None = None, root: str = ".") -> list[dict]:
@@ -207,10 +226,14 @@ def parse_file(filepath: str, next_id: list | None = None, root: str = ".") -> l
     with open(filepath, "rb") as f:
         source = f.read()
 
+    # Language key for includes: cpp for C++ family, py for python, etc.
+    lang_key = ".cpp" if ext in (".cpp", ".cc", ".cxx", ".h", ".hpp") else ext
+    file_includes = get_includes(source, lang_key.lstrip("."))
+
     parser = Parser(lang_obj)
     tree = parser.parse(source)
     nodes = []
-    collect_nodes(tree.root_node, source, filepath, ext, nodes, next_id=next_id, root=root)
+    collect_nodes(tree.root_node, source, filepath, ext, nodes, next_id=next_id, root=root, file_includes=file_includes)
     return nodes
 
 
