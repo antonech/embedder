@@ -1107,13 +1107,15 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
 
     print(f"Parsing {len(file_list)} files with {num_workers} workers...")
 
-    # Parallel file parsing (forkserver avoids fork deadlocks with tree-sitter)
-    ctx = mp.get_context("forkserver")
+    # Parallel file parsing (threads handle tree-sitter C extensions safely)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     all_tree_nodes = []
     chunks = []
     tree_node_count = 0
-    with ctx.Pool(num_workers) as pool:
-        for i, (tree_nodes, flat_chunks, _) in enumerate(pool.imap_unordered(_parse_file_worker, file_list)):
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = [pool.submit(_parse_file_worker, f) for f in file_list]
+        for i, f in enumerate(as_completed(futures)):
+            tree_nodes, flat_chunks, _ = f.result()
             if tree_nodes:
                 all_tree_nodes.append(tree_nodes)
                 tree_node_count += len(tree_nodes)
