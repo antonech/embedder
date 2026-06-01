@@ -118,7 +118,7 @@ class EmbedderApp:
         hits = self.store.search(qv, top_k=top_k)
         return self._format(self._annotate(hits), fmt)
 
-    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.3, fmt: str = "text") -> str:
+    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.7, fmt: str = "text") -> str:
         if self._bm25 is None:
             return self.search(query, top_k=top_k, fmt=fmt)
         qv = self.encoder.embed(query)
@@ -138,14 +138,20 @@ class EmbedderApp:
 
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
 
-        emb_scores = {h["idx"]: h["score"] for h in emb_hits}
+        emb_ranks = {h["idx"]: r for r, h in enumerate(emb_hits)}
+        bm25_ranks = {idx: r for r, idx in enumerate(bm25_top)}
         cand_bm25 = {idx: bm25_raw[idx] for idx in candidates}
         min_b, max_b = min(cand_bm25.values()), max(cand_bm25.values())
 
+        K = 5
         def blend(doc_id):
+            rrf = 0.0
+            if doc_id in emb_ranks:
+                rrf += 1.0 / (K + emb_ranks[doc_id])
+            if doc_id in bm25_ranks:
+                rrf += 1.0 / (K + bm25_ranks[doc_id])
             b = (cand_bm25[doc_id] - min_b) / (max_b - min_b) if max_b > min_b else 0.5
-            e = emb_scores.get(doc_id, 0.0)
-            return (1 - alpha) * b + alpha * e
+            return alpha * rrf + (1 - alpha) * b
 
         scored = [(doc_id, blend(doc_id)) for doc_id in candidates]
         scored.sort(key=lambda x: -x[1])
@@ -207,8 +213,8 @@ def search(query: str, project: str, top_k: int = 5, fmt: str = "text") -> str:
 
 
 @mcp.tool()
-def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "text") -> str:
-    """Search by hybrid BM25 + embedding (alpha=1: pure embed, alpha=0: pure BM25), includes AST context."""
+def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.7, fmt: str = "text") -> str:
+    """Search by hybrid BM25 + embedding (alpha=1: pure RRF, alpha=0: pure BM25), includes AST context."""
     global projects
     if not projects:
         return "Error: server not initialized"
