@@ -817,14 +817,15 @@ class VectorStore:
             self.node_ids.extend([None] * len(texts))
 
     def search(self, query_vec: np.ndarray, top_k: int = 5) -> list[dict]:
-        """Return top_k nearest items as [{text, score, idx, node_id}]."""
+        """Return top_k nearest items as [{text, score, idx, node_id, method}]."""
         if not self.vectors:
             return []
         scores = np.dot(np.stack(self.vectors), query_vec)
         top_idxs = np.argsort(scores)[-top_k:][::-1]
         return [
             {"text": self.texts[i], "score": float(scores[i]), "idx": i,
-             "node_id": self.node_ids[i] if i < len(self.node_ids) else None}
+             "node_id": self.node_ids[i] if i < len(self.node_ids) else None,
+             "method": "embed"}
             for i in top_idxs
         ]
 

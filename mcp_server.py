@@ -35,8 +35,7 @@ class EmbedderApp:
             parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|\d+', w)
             for p in parts:
                 p = p.lower()
-                if len(p) >= 2:
-                    result.append(p)
+                result.append(p)
         return result
 
     def _build_bm25(self):
@@ -81,6 +80,84 @@ class EmbedderApp:
         if not hasattr(self, "_tree"):
             self._tree = TreeIndex(data_dir=self.data_dir)
         return self._tree
+
+    def _get_tree_store(self):
+        if not hasattr(self, "_tree_store"):
+            tree_vec_path = os.path.join(self.data_dir, "tree_vectors.npz")
+            if os.path.exists(tree_vec_path):
+                tvecs, ttexts, _, _ = StorageIO.load(tree_vec_path)
+                self._tree_store = VectorStore()
+                self._tree_store.add_many(tvecs, ttexts)
+                # Build reverse map: tree_uid → flat idx
+                self._tree_to_flat = {}
+                for flat_idx, nid in enumerate(self.store.node_ids):
+                    if nid is not None:
+                        self._tree_to_flat[nid] = flat_idx
+            else:
+                self._tree_store = None
+        return self._tree_store
+
+    def _fuse_with_tree(self, flat_hits: list[dict], qv, top_k: int, beta: float = 0.3) -> list[dict]:
+        """Fuse flat search results with tree vector search results.
+
+        Tree hits that map to a flat chunk (via _tree_to_flat) boost that chunk's score.
+        Unmapped tree hits are added as standalone results.
+        Final results are sorted by score and deduplicated by text.
+        """
+        tree_store = self._get_tree_store()
+        if tree_store is None or len(tree_store) == 0:
+            return flat_hits
+
+        tree_hits = tree_store.search(qv, top_k=top_k * 3)
+
+        # Normalize tree scores
+        tree_scores = [h["score"] for h in tree_hits]
+        t_min, t_max = min(tree_scores), max(tree_scores)
+
+        # Build flat result lookup by flat idx
+        flat_by_idx = {h["idx"]: h for h in flat_hits}
+
+        # Build standalone tree results (not mapped to flat)
+        standalone = []
+        seen_texts = set(h["text"] for h in flat_hits)
+
+        for th in tree_hits:
+            ts = (th["score"] - t_min) / (t_max - t_min) if t_max > t_min else 0.5
+            th_nid = th["idx"]
+            flat_idx = self._tree_to_flat.get(th_nid)
+
+            if flat_idx is not None:
+                if flat_idx in flat_by_idx:
+                    # Boost existing flat result
+                    h = flat_by_idx[flat_idx]
+                    h["score"] = beta * ts + (1 - beta) * h["score"]
+                    h["_tree_boosted"] = True
+                elif th["text"] not in seen_texts:
+                    # Tree result maps to a flat chunk not in top-k; add it
+                    flat_by_idx[flat_idx] = {
+                        "text": th["text"],
+                        "score": beta * ts + (1 - beta) * 0.0,
+                        "idx": flat_idx,
+                        "node_id": th_nid,
+                        "method": "tree_boosted",
+                    }
+                    seen_texts.add(th["text"])
+            elif th["text"] not in seen_texts:
+                # Tree node not mapped to any flat chunk
+                standalone.append({
+                    "text": th["text"],
+                    "score": beta * ts,
+                    "idx": -1,
+                    "node_id": th_nid,
+                    "method": "tree",
+                })
+                seen_texts.add(th["text"])
+
+        merged = sorted(
+            list(flat_by_idx.values()) + standalone,
+            key=lambda h: -h["score"],
+        )
+        return merged[:top_k]
 
     def _annotate(self, hits: list[dict]) -> list[dict]:
         tree = self._get_tree()
@@ -142,24 +219,57 @@ class EmbedderApp:
     def search(self, query: str, top_k: int = 5, fmt: str = "text") -> str:
         qv = self.encoder.embed(query)
         hits = self.store.search(qv, top_k=top_k)
+        hits = self._fuse_with_tree(hits, qv, top_k=top_k)
         return self._format(self._annotate(hits), fmt)
+
+    def _expand_query(self, query: str, qv, top_k: int = 5, max_terms: int = 5) -> list[str]:
+        """Expand BM25 query via pseudo-relevance feedback from embedding hits."""
+        if not self._bm25 or len(self.store) == 0:
+            return self._tokenize(query)
+        hits = self.store.search(qv, top_k=top_k)
+        if not hits:
+            return self._tokenize(query)
+
+        original_tokens = set(self._tokenize(query))
+        # Collect terms from top hits, deduplicated per document
+        term_doc_count = {}
+        for h in hits:
+            seen = set()
+            for t in self._tokenize(h["text"]):
+                if t not in original_tokens and t not in seen:
+                    seen.add(t)
+                    term_doc_count[t] = term_doc_count.get(t, 0) + 1
+
+        # Score by doc frequency * idf
+        scored = []
+        for term, df in term_doc_count.items():
+            idf = self._bm25.idf.get(term, 0.0)
+            scored.append((idf * df, term))
+
+        scored.sort(reverse=True)
+        expanded = list(self._tokenize(query))
+        for _, term in scored[:max_terms]:
+            expanded.append(term)
+        return expanded
 
     def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.7, fmt: str = "text") -> str:
         if self._bm25 is None:
             return self.search(query, top_k=top_k, fmt=fmt)
         qv = self.encoder.embed(query)
         emb_hits = self.store.search(qv, top_k=top_k * 3)
-        tokenized = self._tokenize(query)
+        tokenized = self._expand_query(query, qv, top_k=top_k)
         n = len(self.store)
         bm25_raw = self._bm25.get_scores(tokenized)
         bm25_top = sorted(range(n), key=lambda i: bm25_raw[i], reverse=True)[:top_k * 3]
 
         if alpha >= 1.0:
             hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
+            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
             return self._format(self._annotate(hits), fmt)
         if alpha <= 0.0:
             hits = [{"text": self.store.texts[i], "score": float(bm25_raw[i]), "idx": i, "method": "bm25"}
                     for i in bm25_top[:top_k]]
+            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
             return self._format(self._annotate(hits), fmt)
 
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
@@ -186,6 +296,7 @@ class EmbedderApp:
              "method": "hybrid"}
             for idx, s in scored[:top_k]
         ]
+        hits = self._fuse_with_tree(hits, qv, top_k=top_k)
         return self._format(self._annotate(hits), fmt)
 
     def embed(self, text: str) -> list[float]:
