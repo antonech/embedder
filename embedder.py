@@ -1002,7 +1002,8 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
 
 
 def _parse_file_worker(args):
-    """Worker function for parallel file parsing. Returns (tree_nodes, flat_chunks, rel_path)."""
+    """Worker function for parallel file parsing (CPU only, no GPU)."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     fp, rel, root, tree_exts, exclude = args
     if any(x in fp for x in exclude):
         return [], [], rel
@@ -1041,19 +1042,70 @@ def _parse_file_worker(args):
     return tree_nodes, flat_chunks, rel
 
 
-def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
+def _parse_files(root: str, num_workers: int | None = None,
+                 exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}) -> tuple:
+    """Phase 1: parse source files (CPU only, no GPU model)."""
+    from tree_ast_parser import LANGUAGES as TREE_LANGS
+    tree_exts = tuple(TREE_LANGS.keys())
+    file_list = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ASTParser.SKIP_DIRS]
+        for fn in sorted(filenames):
+            fp = os.path.join(dirpath, fn)
+            rel = os.path.relpath(fp, root)
+            if any(x in fp for x in exclude):
+                continue
+            file_list.append((fp, rel, root, tree_exts, exclude))
+
+    if num_workers is None:
+        num_workers = max(1, (os.cpu_count() or 12) - 1)
+    print(f"Parsing {len(file_list)} files with {num_workers} workers...", flush=True)
+    import multiprocessing as mp
+    ctx = mp.get_context("fork")
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    all_tree_nodes = []
+    chunks = []
+    tree_node_count = 0
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as pool:
+        futures = {pool.submit(_parse_file_worker, f): f[0] for f in file_list}
+        for i, f in enumerate(as_completed(futures)):
+            try:
+                tree_nodes, flat_chunks, _ = f.result()
+            except Exception as e:
+                continue
+            if tree_nodes:
+                all_tree_nodes.append(tree_nodes)
+                tree_node_count += len(tree_nodes)
+            if flat_chunks:
+                chunks.extend(flat_chunks)
+            if (i + 1) % max(1, len(file_list) // 80) == 0 or i == len(file_list) - 1:
+                print(f"  [{i+1}/{len(file_list)}] files, {tree_node_count} tree nodes, {len(chunks)} chunks", flush=True)
+
+    # Renumber tree nodes: local IDs -> global IDs
+    tree_texts = []
+    global_id = 0
+    for file_nodes in all_tree_nodes:
+        old_to_new = {}
+        for n in file_nodes:
+            old_to_new[n["id"]] = global_id
+            n["id"] = global_id
+            global_id += 1
+        for n in file_nodes:
+            pid = n.get("parent_id", -1)
+            n["parent_id"] = old_to_new.get(pid, -1)
+        tree_texts.extend(n["text"] for n in file_nodes)
+    all_tree_nodes = [n for nodes in all_tree_nodes for n in nodes]
+    print(f"  parsed {len(all_tree_nodes)} tree nodes, {len(chunks)} flat chunks", flush=True)
+    return all_tree_nodes, tree_texts, chunks
+
+
+def build_all(root: str, data_dir: str | None = None, num_workers: int | None = None,
+              embed_mode: str = "multi",
               exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}) -> None:
-    """Build both tree and flat indices in a single parallel file walk.
+    """Build both tree and flat indices.
 
-    Each source file is parsed once for both tree nodes and flat chunks,
-    then both indices are saved at the end. File parsing runs in parallel
-    via multiprocessing.Pool.
-
-    Args:
-        root: Project root directory.
-        data_dir: Directory to save the index (default: from config + project name).
-        num_workers: Number of parallel worker processes (default: 8).
-        exclude: Path substrings to skip.
+    Phase 1: parse source files (CPU only, no GPU).
+    Phase 2: load model, embed, save indices.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     embedder_cfg_path = os.path.join(script_dir, "config.json")
@@ -1085,80 +1137,41 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
         model_name = ecfg.get("model_name", model_name)
         device = ecfg.get("device")
 
-    enc = EmbeddingModel(model_name, device=device)
-    flat_store = VectorStore()
-    tree_store = VectorStore()
-
-    import multiprocessing as mp
-    from tree_ast_parser import LANGUAGES as TREE_LANGS
-
-    tree_exts = tuple(TREE_LANGS.keys())
-
-    # Collect file list
-    file_list = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in ASTParser.SKIP_DIRS]
-        for fn in sorted(filenames):
-            fp = os.path.join(dirpath, fn)
-            rel = os.path.relpath(fp, root)
-            if any(x in fp for x in exclude):
-                continue
-            file_list.append((fp, rel, root, tree_exts, exclude))
-
-    print(f"Parsing {len(file_list)} files with {num_workers} workers...")
-
-    # Parallel file parsing (threads handle tree-sitter C extensions safely)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    all_tree_nodes = []
-    chunks = []
-    tree_node_count = 0
-    with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        futures = [pool.submit(_parse_file_worker, f) for f in file_list]
-        for i, f in enumerate(as_completed(futures)):
-            tree_nodes, flat_chunks, _ = f.result()
-            if tree_nodes:
-                all_tree_nodes.append(tree_nodes)
-                tree_node_count += len(tree_nodes)
-            if flat_chunks:
-                chunks.extend(flat_chunks)
-            if (i + 1) % max(1, len(file_list) // 80) == 0 or i == len(file_list) - 1:
-                print(f"  [{i+1}/{len(file_list)}] files, {tree_node_count} tree nodes, {len(chunks)} chunks")
-
-    # Renumber tree nodes: each file has local IDs starting at 0
-    # Assign global sequential IDs and fix parent_id references
-    tree_texts = []
-    global_id = 0
-    for file_nodes in all_tree_nodes:
-        old_to_new = {}
-        for n in file_nodes:
-            old_to_new[n["id"]] = global_id
-            n["id"] = global_id
-            global_id += 1
-        for n in file_nodes:
-            pid = n.get("parent_id", -1)
-            n["parent_id"] = old_to_new.get(pid, -1)
-        tree_texts.extend(n["text"] for n in file_nodes)
-
-    all_tree_nodes = [n for nodes in all_tree_nodes for n in nodes]
-    print(f"  parsed {len(all_tree_nodes)} tree nodes, {len(chunks)} flat chunks")
-
-    # Batch-embed tree texts
-    if tree_texts:
-        tree_vecs = enc.embed_many(tree_texts)
-        tree_store.add_many(tree_vecs, tree_texts)
-
-    # Save tree index
     os.makedirs(data_dir, exist_ok=True)
-    tree_vec_path = os.path.join(data_dir, "tree_vectors.npz")
     tree_json_path = os.path.join(data_dir, "tree_index.json")
-    if tree_store.vectors:
-        StorageIO.save(tree_vec_path, tree_store.vectors, tree_store.texts, enc.dim)
-        tree_data = {"nodes": all_tree_nodes, "texts": tree_store.texts}
-        with open(tree_json_path, "w", encoding="utf8") as f:
-            json.dump(tree_data, f, ensure_ascii=False, indent=2)
-        print(f"Tree index: {len(all_tree_nodes)} nodes -> {tree_vec_path} + {tree_json_path}")
+    tree_exists = os.path.exists(tree_json_path)
+
+    # Phase 1: parse files (no GPU) — always needed for flat chunks
+    all_tree_nodes, tree_texts, chunks = _parse_files(root, num_workers, exclude)
+
+    # Phase 2: embed and save
+    print(f"Loading models (mode={embed_mode})...", flush=True)
+    enc_gpu = None
+    enc_cpu = None
+    if embed_mode in ("multi", "gpu"):
+        enc_gpu = EmbeddingModel(model_name, device=device or "cuda")
+    if embed_mode in ("multi", "cpu"):
+        enc_cpu = EmbeddingModel(model_name, device="cpu")
+
+    if tree_exists and os.path.exists(os.path.join(data_dir, "tree_vectors.npz")):
+        print("Tree index exists, skipping tree embedding", flush=True)
     else:
-        print("No tree nodes found")
+        tree_store = VectorStore()
+        # Batch-embed tree texts
+        if tree_texts:
+            tree_vecs = enc_gpu.embed_many(tree_texts)
+            tree_store.add_many(tree_vecs, tree_texts)
+
+        # Save tree index
+        tree_vec_path = os.path.join(data_dir, "tree_vectors.npz")
+        if tree_store.vectors:
+            StorageIO.save(tree_vec_path, tree_store.vectors, tree_store.texts, enc_gpu.dim)
+            tree_data = {"nodes": all_tree_nodes, "texts": tree_store.texts}
+            with open(tree_json_path, "w", encoding="utf8") as f:
+                json.dump(tree_data, f, ensure_ascii=False, indent=2)
+            print(f"Tree index: {len(all_tree_nodes)} nodes -> {tree_vec_path} + {tree_json_path}", flush=True)
+        else:
+            print("No tree nodes found")
 
     # Enrich flat chunks with tree context and build node_ids
     node_ids = [None] * len(chunks)
@@ -1178,16 +1191,63 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
             if kids:
                 child_names = [c["name"] for c in kids[:6]]
                 chunks[i] += f". Children: {', '.join(child_names)}"
-        matched = sum(1 for n in node_ids if n is not None)
-        print(f"  enriched {matched}/{len(chunks)} chunks with tree context")
+            if (i + 1) % max(1, len(chunks) // 40) == 0 or i == len(chunks) - 1:
+                matched = sum(1 for n in node_ids[:i+1] if n is not None)
+                print(f"  enrich [{i+1}/{len(chunks)}] {matched} matched", flush=True)
     except Exception as e:
         print(f"  tree enrichment skipped: {e}")
 
-    # Save flat index
-    vecs = enc.embed_many(chunks)
+    # Flat chunk embedding
+    print(f"  embedding {len(chunks)} flat chunks (mode={embed_mode})...", flush=True)
+    BATCH = 1024
+
+    def _embed_sequential(model: EmbeddingModel, texts: list[str]):
+        out = []
+        for i in range(0, len(texts), BATCH):
+            batch = texts[i:i + BATCH]
+            out.append(model.embed_many(batch))
+            print(f"    [{min(i+BATCH, len(texts))}/{len(texts)}]", flush=True)
+        return np.concatenate(out) if out else np.array([])
+
+    if embed_mode == "multi":
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        import queue
+        chunk_queue = queue.Queue()
+        for i in range(0, len(chunks), BATCH):
+            chunk_queue.put((i, chunks[i:i + BATCH]))
+        results = []
+        results_lock = threading.Lock()
+
+        def _embed_worker(model: EmbeddingModel, name: str):
+            import torch
+            if name == "CPU":
+                torch.set_num_threads(10)
+            while True:
+                try:
+                    idx, batch = chunk_queue.get_nowait()
+                except queue.Empty:
+                    return
+                vecs = model.embed_many(batch)
+                with results_lock:
+                    results.append((idx, vecs))
+                    print(f"    {name}: {len(results)*BATCH}/{len(chunks)}", flush=True)
+                chunk_queue.task_done()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pool.submit(_embed_worker, enc_gpu, "GPU")
+            pool.submit(_embed_worker, enc_cpu, "CPU")
+        results.sort(key=lambda x: x[0])
+        vecs = np.concatenate([v for _, v in results])
+    elif embed_mode == "gpu":
+        vecs = _embed_sequential(enc_gpu, chunks)
+    else:
+        vecs = _embed_sequential(enc_cpu, chunks)
+
+    flat_store = VectorStore()
     flat_store.add_many(vecs, chunks)
     out = os.path.join(data_dir, "enriched_vectors.npz")
-    StorageIO.save(out, flat_store.vectors, flat_store.texts, enc.dim, node_ids=node_ids)
+    StorageIO.save(out, flat_store.vectors, flat_store.texts, enc_gpu.dim, node_ids=node_ids)
     print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 
@@ -1198,10 +1258,13 @@ if __name__ == "__main__":
     parser.add_argument('--delta', action='store_true', help='Build delta index (only changed files)')
     parser.add_argument('--data-dir', default=None, help='Directory to save the index (default: from config)')
     parser.add_argument('--root', default='.', help='Project root directory')
+    parser.add_argument('--workers', type=int, default=10, help='Number of worker processes for file parsing (default: 10)')
+    parser.add_argument('--embed-mode', choices=['multi', 'gpu', 'cpu'], default='multi',
+                        help='Embedding mode: multi (GPU+CPU, default), gpu-only, cpu-only')
     args = parser.parse_args()
 
     if args.build_all:
-        build_all(args.root, args.data_dir)
+        build_all(args.root, args.data_dir, num_workers=args.workers, embed_mode=args.embed_mode)
     elif args.build_flat:
         build_flat_index(args.root, args.data_dir, args.delta)
     else:

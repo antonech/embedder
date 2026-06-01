@@ -1,5 +1,4 @@
 import os, json, glob
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 from tree_sitter import Language, Parser
 import tree_sitter_python, tree_sitter_cpp, tree_sitter_bash

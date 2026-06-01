@@ -9,7 +9,12 @@ from tree_search import TreeIndex
 
 
 class EmbedderApp:
-    def __init__(self, project_name: str, model_name: str = "all-MiniLM-L6-v2", data_dir: str = "data", device: str | None = None):
+    def __init__(
+        self, project_name: str, model_name: str = "all-MiniLM-L6-v2",
+        data_dir: str = "data", device: str | None = None,
+        cross_encoder_model: str | None = None,
+        cross_encoder_device: str | None = None,
+    ):
         self.project_name = project_name
         self.model_name = model_name
         # Handle CUDA fallback
@@ -25,6 +30,22 @@ class EmbedderApp:
         self.encoder = EmbeddingModel(model_name, device=device)
         self.store = VectorStore()
         self._bm25 = None
+        self.cross_encoder = None
+        self.cross_encoder_tokenizer = None
+        if cross_encoder_model:
+            try:
+                from transformers import AutoTokenizer, AutoModelForSequenceClassification
+                ce_dev = cross_encoder_device or device or "cpu"
+                if ce_dev == "cuda":
+                    import torch
+                    if not torch.cuda.is_available():
+                        ce_dev = "cpu"
+                self.cross_encoder_tokenizer = AutoTokenizer.from_pretrained(cross_encoder_model)
+                self.cross_encoder = AutoModelForSequenceClassification.from_pretrained(
+                    cross_encoder_model
+                ).to(ce_dev)
+            except Exception as e:
+                print(f"Warning: failed to load cross-encoder '{cross_encoder_model}': {e}")
 
     def _tokenize(self, text: str) -> list[str]:
         words = re.split(r'[^a-zA-Z0-9]+', text)
@@ -187,6 +208,29 @@ class EmbedderApp:
                 h["context"]["parent"] = {"name": p["name"], "type": p["type"]}
         return hits
 
+    def _rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
+        if not hits or self.cross_encoder is None:
+            return hits
+        texts = [h["text"] for h in hits]
+        pairs = [[query, t] for t in texts]
+        import torch
+        inputs = self.cross_encoder_tokenizer(
+            pairs, padding=True, truncation=True, return_tensors="pt"
+        )
+        device = self.cross_encoder.device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = self.cross_encoder(**inputs).logits
+        # sigmoid to convert logits to [0, 1] relevance probabilities
+        probs = torch.sigmoid(logits.squeeze(-1)).cpu().numpy().tolist()
+        if isinstance(probs, float):
+            probs = [probs]
+        for i, h in enumerate(hits):
+            h["score"] = round(float(probs[i]), 4)
+            h["method"] = "reranked"
+        hits.sort(key=lambda h: h["score"], reverse=True)
+        return hits[:top_k]
+
     @staticmethod
     def _format(hits: list[dict], fmt: str = "text") -> str:
         if fmt == "json":
@@ -244,17 +288,23 @@ class EmbedderApp:
             expanded.append(term)
         return expanded
 
-    def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text") -> str:
+    def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool | None = None) -> str:
+        do_rerank = rerank if rerank is not None else (self.cross_encoder is not None)
+
         if mode == "embed":
             qv = self.encoder.embed(query)
             hits = self.store.search(qv, top_k=top_k)
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            if do_rerank:
+                hits = self._rerank(query, hits, top_k)
             return self._format(self._annotate(hits), fmt)
 
         if self._bm25 is None:
             qv = self.encoder.embed(query)
             hits = self.store.search(qv, top_k=top_k)
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            if do_rerank:
+                hits = self._rerank(query, hits, top_k)
             return self._format(self._annotate(hits), fmt)
 
         qv = self.encoder.embed(query)
@@ -273,6 +323,8 @@ class EmbedderApp:
                 for i in bm25_top[:top_k]
             ]
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            if do_rerank:
+                hits = self._rerank(query, hits, top_k)
             return self._format(self._annotate(hits), fmt)
 
         if alpha is None:
@@ -280,6 +332,8 @@ class EmbedderApp:
         if alpha >= 1.0:
             hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            if do_rerank:
+                hits = self._rerank(query, hits, top_k)
             return self._format(self._annotate(hits), fmt)
         if alpha <= 0.0:
             top_scores = [bm25_raw[i] for i in bm25_top[:top_k]]
@@ -291,6 +345,8 @@ class EmbedderApp:
                 for i in bm25_top[:top_k]
             ]
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            if do_rerank:
+                hits = self._rerank(query, hits, top_k)
             return self._format(self._annotate(hits), fmt)
 
         emb_hits = self.store.search(qv, top_k=top_k * 3)
@@ -319,6 +375,8 @@ class EmbedderApp:
             for idx, s in scored[:top_k]
         ]
         hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+        if do_rerank:
+            hits = self._rerank(query, hits, top_k)
         return self._format(self._annotate(hits), fmt)
 
     def embed(self, text: str) -> list[float]:
@@ -354,15 +412,15 @@ mcp = FastMCP("embedder")
 
 
 @mcp.tool()
-def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text") -> str:
-    """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7). Includes AST context."""
+def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool | None = None) -> str:
+    """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7). rerank=True uses cross-encoder. Includes AST context."""
     global projects
     if not projects:
         return "Error: server not initialized"
     target_app = projects.get(project)
     if target_app is None:
         return f"Error: project '{project}' not found"
-    return target_app.search(query, top_k=top_k, mode=mode, alpha=alpha, fmt=fmt)
+    return target_app.search(query, top_k=top_k, mode=mode, alpha=alpha, fmt=fmt, rerank=rerank)
 
 
 @mcp.tool()
@@ -483,6 +541,8 @@ async def main():
     model_name = "all-MiniLM-L6-v2"
     device = None
     data_dir = "data"
+    cross_encoder_model = None
+    cross_encoder_device = None
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cfg_path = os.path.join(script_dir, "config.json")
     if os.path.exists(cfg_path):
@@ -491,6 +551,8 @@ async def main():
         model_name = cfg.get("model_name", model_name)
         device = cfg.get("device")
         store_root = cfg.get("embedding_store", "")
+        cross_encoder_model = cfg.get("cross_encoder_model")
+        cross_encoder_device = cfg.get("cross_encoder_device") or device
         if store_root:
             store_root = os.path.expandvars(os.path.expanduser(store_root))
 
@@ -500,7 +562,11 @@ async def main():
         data_dir = os.path.join(store_root, project_name)
 
     if project_name not in projects:
-        projects[project_name] = EmbedderApp(project_name, model_name, data_dir=data_dir, device=device)
+        projects[project_name] = EmbedderApp(
+            project_name, model_name, data_dir=data_dir, device=device,
+            cross_encoder_model=cross_encoder_model,
+            cross_encoder_device=cross_encoder_device,
+        )
 
     app = projects[project_name]
 
