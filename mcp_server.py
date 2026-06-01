@@ -216,12 +216,6 @@ class EmbedderApp:
             lines.append("")
         return "\n".join(lines).strip()
 
-    def search(self, query: str, top_k: int = 5, fmt: str = "text") -> str:
-        qv = self.encoder.embed(query)
-        hits = self.store.search(qv, top_k=top_k)
-        hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-        return self._format(self._annotate(hits), fmt)
-
     def _expand_query(self, query: str, qv, top_k: int = 5, max_terms: int = 5) -> list[str]:
         """Expand BM25 query via pseudo-relevance feedback from embedding hits."""
         if not self._bm25 or len(self.store) == 0:
@@ -231,7 +225,6 @@ class EmbedderApp:
             return self._tokenize(query)
 
         original_tokens = set(self._tokenize(query))
-        # Collect terms from top hits, deduplicated per document
         term_doc_count = {}
         for h in hits:
             seen = set()
@@ -240,7 +233,6 @@ class EmbedderApp:
                     seen.add(t)
                     term_doc_count[t] = term_doc_count.get(t, 0) + 1
 
-        # Score by doc frequency * idf
         scored = []
         for term, df in term_doc_count.items():
             idf = self._bm25.idf.get(term, 0.0)
@@ -252,26 +244,39 @@ class EmbedderApp:
             expanded.append(term)
         return expanded
 
-    def hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.7, fmt: str = "text") -> str:
+    def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text") -> str:
+        if mode == "embed":
+            qv = self.encoder.embed(query)
+            hits = self.store.search(qv, top_k=top_k)
+            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            return self._format(self._annotate(hits), fmt)
+
         if self._bm25 is None:
-            return self.search(query, top_k=top_k, fmt=fmt)
+            qv = self.encoder.embed(query)
+            hits = self.store.search(qv, top_k=top_k)
+            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            return self._format(self._annotate(hits), fmt)
+
         qv = self.encoder.embed(query)
-        emb_hits = self.store.search(qv, top_k=top_k * 3)
         tokenized = self._expand_query(query, qv, top_k=top_k)
         n = len(self.store)
         bm25_raw = self._bm25.get_scores(tokenized)
         bm25_top = sorted(range(n), key=lambda i: bm25_raw[i], reverse=True)[:top_k * 3]
 
-        if alpha >= 1.0:
-            hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
-            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-            return self._format(self._annotate(hits), fmt)
-        if alpha <= 0.0:
+        if mode == "bm25":
             hits = [{"text": self.store.texts[i], "score": float(bm25_raw[i]), "idx": i, "method": "bm25"}
                     for i in bm25_top[:top_k]]
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
             return self._format(self._annotate(hits), fmt)
 
+        if alpha is None:
+            alpha = 0.7
+        if alpha >= 1.0 or alpha <= 0.0:
+            hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
+            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+            return self._format(self._annotate(hits), fmt)
+
+        emb_hits = self.store.search(qv, top_k=top_k * 3)
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
 
         emb_ranks = {h["idx"]: r for r, h in enumerate(emb_hits)}
@@ -332,27 +337,15 @@ mcp = FastMCP("embedder")
 
 
 @mcp.tool()
-def search(query: str, project: str, top_k: int = 5, fmt: str = "text") -> str:
-    """Search documents by semantic similarity, includes AST context (children/parent/siblings)."""
+def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text") -> str:
+    """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7). Includes AST context."""
     global projects
     if not projects:
         return "Error: server not initialized"
     target_app = projects.get(project)
     if target_app is None:
         return f"Error: project '{project}' not found"
-    return target_app.search(query, top_k=top_k, fmt=fmt)
-
-
-@mcp.tool()
-def hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.7, fmt: str = "text") -> str:
-    """Search by hybrid BM25 + embedding (alpha=1: pure RRF, alpha=0: pure BM25), includes AST context."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.hybrid_search(query, top_k=top_k, alpha=alpha, fmt=fmt)
+    return target_app.search(query, top_k=top_k, mode=mode, alpha=alpha, fmt=fmt)
 
 
 @mcp.tool()
