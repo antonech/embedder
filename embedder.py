@@ -1107,8 +1107,8 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
 
     print(f"Parsing {len(file_list)} files with {num_workers} workers...")
 
-    # Parallel file parsing (spawn avoids fork deadlocks with tree-sitter C extensions)
-    ctx = mp.get_context("spawn")
+    # Parallel file parsing (forkserver avoids fork deadlocks with tree-sitter)
+    ctx = mp.get_context("forkserver")
     all_tree_nodes = []
     chunks = []
     tree_node_count = 0
@@ -1119,7 +1119,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int = 8,
                 tree_node_count += len(tree_nodes)
             if flat_chunks:
                 chunks.extend(flat_chunks)
-            if (i + 1) % max(1, len(file_list) // 20) == 0 or i == len(file_list) - 1:
+            if (i + 1) % max(1, len(file_list) // 80) == 0 or i == len(file_list) - 1:
                 print(f"  [{i+1}/{len(file_list)}] files, {tree_node_count} tree nodes, {len(chunks)} chunks")
 
     # Renumber tree nodes: each file has local IDs starting at 0
