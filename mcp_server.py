@@ -326,12 +326,6 @@ class EmbedderApp:
         delta = getattr(self, '_delta_count', 0)
         return json.dumps({"vectors": n, "delta": delta, "sample_texts": sample}, ensure_ascii=False)
 
-    def tree_search(self, query: str, top_k: int = 5) -> str:
-        return self.search(query, top_k=top_k, fmt="json")
-
-    def tree_hybrid_search(self, query: str, top_k: int = 5, alpha: float = 0.5) -> str:
-        return self.hybrid_search(query, top_k=top_k, alpha=alpha, fmt="json")
-
 
 projects: dict[str, EmbedderApp] = {}
 mcp = FastMCP("embedder")
@@ -407,30 +401,6 @@ def init_store(data_path: str, project: str) -> str:
     if target_app is None:
         return f"Error: project '{project}' not found"
     return target_app.init(data_path)
-
-
-@mcp.tool()
-def tree_search(query: str, project: str, top_k: int = 5, fmt: str = "json") -> str:
-    """Alias for search (json format)."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.tree_search(query, top_k)
-
-
-@mcp.tool()
-def tree_hybrid_search(query: str, project: str, top_k: int = 5, alpha: float = 0.5, fmt: str = "json") -> str:
-    """Alias for hybrid_search (json format)."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.tree_hybrid_search(query, top_k, alpha)
 
 
 @mcp.tool()
