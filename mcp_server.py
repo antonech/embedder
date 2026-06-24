@@ -559,7 +559,7 @@ async def main():
         device = cfg.get("device")
         store_root = cfg.get("embedding_store", "")
         cross_encoder_model = cfg.get("cross_encoder_model")
-        cross_encoder_device = cfg.get("cross_encoder_device") or device
+        cross_encoder_device = device  # derived from device
         if store_root:
             store_root = os.path.expandvars(os.path.expanduser(store_root))
 

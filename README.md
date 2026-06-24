@@ -144,8 +144,7 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
     "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,
     "embedding_store": "~/project/embedder_store",
-    "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    "cross_encoder_device": "cuda"
+    "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2"
 }
 ```
 
@@ -158,7 +157,6 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
 - `use_clang` — enable libclang for C++ parsing (vs tree-sitter)
 - `embedding_store` — base directory for per-project indices (supports `~` and `$VAR` expansion)
 - `query_prefix` / `passage_prefix` — override auto-detected E5/BGE instruction prefixes (set to `""` to disable)
-- `cross_encoder_model` — optional cross-encoder model for reranking (e.g. `cross-encoder/ms-marco-MiniLM-L-6-v2`)
-- `cross_encoder_device` — device for cross-encoder (defaults to `device` value)
+- `cross_encoder_model` — optional cross-encoder model for reranking (e.g. `cross-encoder/ms-marco-MiniLM-L-6-v2`); uses `device` setting
 
 Priority: explicit arg > config.json > defaults.

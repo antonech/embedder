@@ -3,6 +3,5 @@
     "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,
     "embedding_store": "~/project/embedder_store",
-    "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-    "cross_encoder_device": "cuda"
+    "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2"
 }
