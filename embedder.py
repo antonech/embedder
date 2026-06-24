@@ -283,7 +283,7 @@ class ASTParser:
                 cls._use_clang = cfg.get("use_clang", False)
             else:
                 cls._use_clang = False
-        return CompositeStrategy.from_keys(enrichment_keys or ["kind", "name", "signature", "docstring"])
+        return CompositeStrategy.from_keys(enrichment_keys or ["signature", "body", "docstring"])
 
     @classmethod
     def scan_project(cls, root: str, enrichment_keys: Optional[list[str]] = None) -> list[str]:
@@ -935,6 +935,9 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
     # Load model configuration — project root overrides, else fall back to embedder config
     model_name = "all-MiniLM-L6-v2"
     device = None
+    query_prefix = None
+    passage_prefix = None
+    batch_size = 1024
     cfg_path = os.path.join(root, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
@@ -943,6 +946,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         device = cfg.get("device")
         query_prefix = cfg.get("query_prefix")
         passage_prefix = cfg.get("passage_prefix")
+        batch_size = cfg.get("batch_size", batch_size)
     elif os.path.exists(embedder_cfg_path):
         with open(embedder_cfg_path) as f:
             ecfg = json.load(f)
@@ -950,9 +954,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         device = ecfg.get("device")
         query_prefix = ecfg.get("query_prefix")
         passage_prefix = ecfg.get("passage_prefix")
-    else:
-        query_prefix = None
-        passage_prefix = None
+        batch_size = ecfg.get("batch_size", batch_size)
 
     # Initialize model
     enc = EmbeddingModel(model_name, device=device,
@@ -1193,6 +1195,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     device = None
     query_prefix = None
     passage_prefix = None
+    batch_size = 1024
     cfg_path = os.path.join(root, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
@@ -1201,6 +1204,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         device = cfg.get("device")
         query_prefix = cfg.get("query_prefix")
         passage_prefix = cfg.get("passage_prefix")
+        batch_size = cfg.get("batch_size", batch_size)
     elif os.path.exists(embedder_cfg_path):
         with open(embedder_cfg_path) as f:
             ecfg = json.load(f)
@@ -1208,6 +1212,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         device = ecfg.get("device")
         query_prefix = ecfg.get("query_prefix")
         passage_prefix = ecfg.get("passage_prefix")
+        batch_size = ecfg.get("batch_size", batch_size)
 
     # Infer mode from device
     if embed_mode is None:
@@ -1222,7 +1227,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     os.makedirs(data_dir, exist_ok=True)
     tree_json_path = os.path.join(data_dir, "tree_index.json")
     tree_exists = os.path.exists(tree_json_path)
-    BATCH = 1024
+    BATCH = batch_size
 
     # Phase 1: parse files (no GPU) — always needed for flat chunks
     all_tree_nodes, tree_texts, chunks = _parse_files(root, num_workers, exclude)
