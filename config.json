@@ -1,6 +1,5 @@
 {
     "model_name": "intfloat/e5-small-v2",
-    "device": "cuda",
     "top_k": 5,
     "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,
