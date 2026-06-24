@@ -141,7 +141,6 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
 {
     "model_name": "intfloat/e5-small-v2",
     // "device": "cuda",       // uncomment for GPU-only; omit for auto multi (GPU+CPU) or CPU
-    "top_k": 5,
     "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,
     "embedding_store": "~/project/embedder_store",
@@ -155,7 +154,6 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
   - `"cuda"` / `"cuda:0"` / `"cuda:1"` — GPU only
   - `"cpu"` — CPU only
   - omitted — auto-detect: GPU + CPU parallel (`multi`) if CUDA available, else `"cpu"`; CLI `--embed-mode` overrides
-- `top_k` — default number of search results
 - `enrichment` — ordered list of strategy keys for flat chunk construction (default: `["signature", "body", "docstring"]`)
 - `use_clang` — enable libclang for C++ parsing (vs tree-sitter)
 - `embedding_store` — base directory for per-project indices (supports `~` and `$VAR` expansion)
