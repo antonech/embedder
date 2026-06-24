@@ -140,8 +140,7 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
 ```json
 {
     "model_name": "intfloat/e5-small-v2",
-    "float_type": "fp16",
-    "batch_size": 4096,
+    "batch_size": 1024,
     // "device": "cuda",       // uncomment for GPU-only; omit for auto multi (GPU+CPU) or CPU
     "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,

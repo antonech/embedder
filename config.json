@@ -1,7 +1,6 @@
 {
     "model_name": "intfloat/e5-small-v2",
-    "float_type": "fp16",
-    "batch_size": 4096,
+    "batch_size": 1024,
     "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,
     "embedding_store": "~/project/embedder_store",
