@@ -1350,11 +1350,17 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
                     print(f"    {name}: {_done}/{len(embed_chunks)}", flush=True)
                 chunk_queue.task_done()
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        pool = ThreadPoolExecutor(max_workers=2)
+        try:
             if enc_gpu is not None:
                 pool.submit(_embed_worker, enc_gpu, "GPU")
             if enc_cpu is not None:
                 pool.submit(_embed_worker, enc_cpu, "CPU")
+            pool.shutdown()
+        except KeyboardInterrupt:
+            pool.shutdown(wait=False, cancel_futures=True)
+            print("\nInterrupted, exiting...", flush=True)
+            return
         results.sort(key=lambda x: x[0])
         flat_dim = (enc_gpu or enc_cpu).dim
         vecs = np.empty((len(embed_chunks), flat_dim), dtype=np.float32)
