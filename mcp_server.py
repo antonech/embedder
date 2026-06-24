@@ -3,6 +3,7 @@ import json
 import asyncio
 import argparse
 import re
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 from embedder import EmbeddingModel, StorageIO, VectorStore
 from tree_search import TreeIndex
@@ -288,11 +289,15 @@ class EmbedderApp:
             expanded.append(term)
         return expanded
 
+    def _embed_query(self, query: str) -> np.ndarray:
+        prefixed = self.encoder.query_prefix + query if self.encoder.query_prefix else query
+        return self.encoder.embed(prefixed)
+
     def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool | None = None) -> str:
         do_rerank = rerank if rerank is not None else (self.cross_encoder is not None)
+        qv = self._embed_query(query)
 
         if mode == "embed":
-            qv = self.encoder.embed(query)
             hits = self.store.search(qv, top_k=top_k)
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
             if do_rerank:
@@ -300,14 +305,11 @@ class EmbedderApp:
             return self._format(self._annotate(hits), fmt)
 
         if self._bm25 is None:
-            qv = self.encoder.embed(query)
             hits = self.store.search(qv, top_k=top_k)
             hits = self._fuse_with_tree(hits, qv, top_k=top_k)
             if do_rerank:
                 hits = self._rerank(query, hits, top_k)
             return self._format(self._annotate(hits), fmt)
-
-        qv = self.encoder.embed(query)
         tokenized = self._expand_query(query, qv, top_k=top_k)
         n = len(self.store)
         bm25_raw = self._bm25.get_scores(tokenized)
@@ -386,12 +388,17 @@ class EmbedderApp:
         return self.encoder.embed_many(texts).tolist()
 
     def add_document(self, text: str) -> str:
-        vec = self.encoder.embed(text)
+        prefixed = self.encoder.passage_prefix + text if self.encoder.passage_prefix else text
+        vec = self.encoder.embed(prefixed)
         self.store.add(vec, text)
         return f"Added, total vectors: {len(self.store)}"
 
     def add_documents(self, texts: list[str]) -> str:
-        vecs = self.encoder.embed_many(texts)
+        if self.encoder.passage_prefix:
+            prefixed = [self.encoder.passage_prefix + t for t in texts]
+        else:
+            prefixed = texts
+        vecs = self.encoder.embed_many(prefixed)
         self.store.add_many(vecs, texts)
         return f"Added {len(texts)} docs, total vectors: {len(self.store)}"
 

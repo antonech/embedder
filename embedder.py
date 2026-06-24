@@ -108,7 +108,12 @@ class SignatureStrategy(EnrichmentStrategy):
         return "signature"
 
     def enrich(self, node: dict) -> str:
+        sig = node.get("signature")
+        if sig and isinstance(sig, str):
+            return sig
         args = node.get("args", [])
+        if isinstance(args, list) and not args:
+            return ""
         if isinstance(args, list):
             args_str = ", ".join(a.get("name", str(a)) if isinstance(a, dict) else str(a) for a in args)
         else:
@@ -129,7 +134,7 @@ class DocstringStrategy(EnrichmentStrategy):
 
 
 class BodyStrategy(EnrichmentStrategy):
-    """First N non-empty lines of body as summary."""
+    """Methods, fields, bases, and body lines as summary."""
 
     MAX_LINES = 5
 
@@ -138,11 +143,33 @@ class BodyStrategy(EnrichmentStrategy):
         return "body"
 
     def enrich(self, node: dict) -> str:
-        body = node.get("body", node.get("methods", []))
+        parts = []
+        in_class = node.get("in_class", "")
+        if in_class:
+            parts.append(f"In class: {in_class}")
+        methods = node.get("methods", [])
+        if methods:
+            m_strs = [str(m)[:80] for m in methods[:8] if str(m).strip()]
+            if m_strs:
+                parts.append("Methods: " + ", ".join(m_strs))
+        fields = node.get("fields", [])
+        if fields:
+            f_strs = [str(f)[:60] for f in fields[:6] if str(f).strip()]
+            if f_strs:
+                parts.append("Fields: " + ", ".join(f_strs))
+        bases = node.get("bases", [])
+        if bases:
+            b_strs = [str(b)[:60] for b in bases[:4]]
+            if b_strs:
+                parts.append("Inherits: " + ", ".join(b_strs))
+        body = node.get("body", [])
         if isinstance(body, list):
             lines = [str(b)[:100] for b in body if str(b).strip()]
-            return " | ".join(lines[:self.MAX_LINES])
-        return str(body)[:200]
+            for line in lines[:self.MAX_LINES]:
+                parts.append(line)
+        elif isinstance(body, str) and body.strip():
+            parts.append(body[:200])
+        return " | ".join(parts)
 
 
 class CompositeStrategy(EnrichmentStrategy):
@@ -286,9 +313,12 @@ class ASTParser:
                                 chunks.append(c)
                             else:
                                 enriched = strategy.enrich(c)
-                                f = c.get("file")
-                                if f:
-                                    enriched += f" ({f})"
+                                kind = c.get("kind", "")
+                                name = c.get("name", "")
+                                f = c.get("file", "")
+                                prefix = f"{kind} {f} {name}".strip()
+                                if prefix:
+                                    enriched = f"{prefix} | {enriched}" if enriched else prefix
                                 chunks.append(enriched)
                 except Exception as e:
                     pass
@@ -303,53 +333,41 @@ class ASTParser:
             return super().visit(node)
 
     @classmethod
-    def _parse_python(cls, source: str, path_hint: str = "") -> list[str]:
-        chunks: list[str] = []
+    def _parse_python(cls, source: str, path_hint: str = "") -> list[dict | str]:
+        chunks: list[dict | str] = []
         try:
             tree = ast.parse(source)
             cls._ParentVisitor().visit(tree)
             for node in ast.walk(tree):
                 if isinstance(node, ast.ClassDef):
                     doc = ast.get_docstring(node) or ""
-                    chunk = f"Class {path_hint} {node.name}"
-                    if node.bases:
-                        bases = [b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else str(b)) for b in node.bases]
-                        chunk += f". Inherits: {', '.join(bases)}"
+                    bases = [b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else str(b)) for b in node.bases]
                     methods = [n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-                    if methods:
-                        chunk += f". Methods: {', '.join(methods[:6])}"
-                    if doc:
-                        doc_short = doc.strip().replace("\n", " ")[:200]
-                        chunk += f". Doc: {doc_short}"
-                    chunks.append(chunk)
+                    chunks.append({
+                        "kind": "Class",
+                        "name": node.name,
+                        "file": path_hint,
+                        "docstring": doc,
+                        "methods": methods,
+                        "bases": bases,
+                    })
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if hasattr(node, 'parent') and isinstance(node.parent, ast.ClassDef):
                         continue
                     doc = ast.get_docstring(node) or ""
                     args = [a.arg for a in node.args.args]
-                    
-                    # Extract meaningful subwords from function name for enrichment
-                    import re
-                    subwords = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', node.name)
-                    # Also split by underscore if present
-                    if '_' in node.name:
-                        subwords = [word for subword in subwords for word in subword.split('_')]
-                    subwords = [sw.lower() for sw in subwords if sw]
-                    
-                    chunk = f"Function {path_hint} {node.name}"
-                    if len(subwords) > 1:
-                        chunk += f" ({' '.join(subwords)})"
-                    chunk += f". Args: ({', '.join(args)})"
                     try:
                         body_lines = [ast.unparse(s)[:80] for s in node.body[:2]]
-                        if body_lines:
-                            chunk += f". Body: {'; '.join(body_lines)}"
                     except Exception:
-                        pass
-                    if doc:
-                        doc_short = doc.strip().replace("\n", " ")[:200]
-                        chunk += f". Doc: {doc_short}"
-                    chunks.append(chunk)
+                        body_lines = []
+                    chunks.append({
+                        "kind": "Function",
+                        "name": node.name,
+                        "file": path_hint,
+                        "args": args,
+                        "docstring": doc,
+                        "body": body_lines,
+                    })
         except SyntaxError as e:
             chunks.append(f"[file] {path_hint} (parse error: {e})")
         return chunks
@@ -357,8 +375,9 @@ class ASTParser:
     # --- Fallback: line-based chunking ---
 
     @classmethod
-    def _parse_fallback(cls, source: str, path_hint: str = "", label: str = "") -> list[str]:
-        chunks = []
+    @classmethod
+    def _parse_fallback(cls, source: str, path_hint: str = "", label: str = "") -> list[dict | str]:
+        chunks: list[dict | str] = []
         blabel = label or _LABELS["default"].get("file", "File")
         lines = source.split('\n')
         block_lines = []
@@ -370,12 +389,22 @@ class ASTParser:
                 if block_lines:
                     block_text = ' '.join(block_lines)
                     if len(block_text) >= 20:
-                        chunks.append(f"{blabel} {path_hint} {block_text[:512]}")
+                        chunks.append({
+                            "kind": blabel,
+                            "name": "",
+                            "file": path_hint,
+                            "body": block_text[:512],
+                        })
                     block_lines = []
         if block_lines:
             block_text = ' '.join(block_lines)
             if len(block_text) >= 20:
-                chunks.append(f"{blabel} {path_hint} {block_text[:512]}")
+                chunks.append({
+                    "kind": blabel,
+                    "name": "",
+                    "file": path_hint,
+                    "body": block_text[:512],
+                })
         return chunks
 
     # --- C/C++ handler (tree-sitter) ---
@@ -563,36 +592,20 @@ class ASTParser:
                                 params = decl.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
 
-                        extra = []
-                        # Template params
-                        tpl = _ts_template_params(node)
-                        if tpl:
-                            extra.append(f"template {tpl}")
-                        # Base classes for class/struct
-                        bases = _ts_base_classes(node) if node.type in ("class_specifier", "struct_specifier") else ""
-                        if bases:
-                            extra.append(bases)
-                        # Body summary
-                        body = _ts_body_summary(node)
-                        if body:
-                            extra.append(f"{{ {body} }}")
-                        # NL description
-                        nl_desc = _ts_nl_description(name, node, bases)
-                        if nl_desc:
-                            extra.append(nl_desc)
-
-                        # Natural language text for embedding
                         label = _LABELS["mapping"].get(node.type, node.type)
-                        text = f"{label} {path_hint} {name}"
-                        if class_name and node.type in ("function_definition", "template_function", "template_method"):
-                            text += f" (in {class_name})"
-                        if extra:
-                            text += ". " + ". ".join(extra)
-                        if sig_text:
-                            text += f". Signature: {sig_text}"
-                        if doc:
-                            text += f". Doc: {doc.strip()}"
-                        chunks.append(text)
+                        body_summary = _ts_body_summary(node)
+                        bases_text = _ts_base_classes(node) if node.type in ("class_specifier", "struct_specifier") else ""
+                        bases_list = [b.strip() for b in bases_text.replace(": ", "").split(",") if b.strip()] if bases_text else []
+                        chunks.append({
+                            "kind": label,
+                            "name": name,
+                            "file": path_hint,
+                            "signature": sig_text,
+                            "docstring": doc.strip() if doc else "",
+                            "body": body_summary,
+                            "bases": bases_list,
+                            "in_class": class_name if class_name and node.type in ("function_definition", "template_function", "template_method") else "",
+                        })
                 next_class = class_name
                 if node.type in ("class_specifier", "struct_specifier"):
                     nname = node.child_by_field_name("name")
@@ -704,7 +717,8 @@ class ASTParser:
     # --- Tree-sitter based handler (JS / Go / Rust) ---
 
     @classmethod
-    def _parse_treesitter(cls, source: str, path_hint: str = "") -> list[str]:
+    @classmethod
+    def _parse_treesitter(cls, source: str, path_hint: str = "") -> list[dict | str]:
         if not _TS_AVAILABLE:
             return []
 
@@ -716,7 +730,7 @@ class ASTParser:
         lang_name, lang_fn = lang_config
         significant = _TS_SIGNIFICANT.get(lang_name, set())
 
-        chunks: list[str] = []
+        chunks: list[dict | str] = []
         try:
             parser = Parser(Language(lang_fn()))
             tree = parser.parse(source.encode("utf8", errors="ignore"))
@@ -734,14 +748,14 @@ class ASTParser:
                     if name:
                         params = node.child_by_field_name("parameters")
                         sig_text = params.text.decode("utf8", errors="ignore") if params else ""
-                        # Build text in the same format as tree parser
                         label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
-                        text = f"{label} {path_hint} {name}"
-                        if sig_text:
-                            text += f" ({sig_text})"
-                        if doc:
-                            text += f" | {doc}"
-                        chunks.append(text)
+                        chunks.append({
+                            "kind": label,
+                            "name": name,
+                            "file": path_hint,
+                            "signature": sig_text,
+                            "docstring": doc.strip() if doc else "",
+                        })
                 for c in node.children:
                     walk(c)
             walk(root)
@@ -770,8 +784,11 @@ ASTParser.register('*.rs', ASTParser._parse_treesitter)
 class EmbeddingModel:
     """Wraps a SentenceTransformer model for producing embeddings."""
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = None):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = None,
+                 query_prefix: str | None = None, passage_prefix: str | None = None):
         self.model = SentenceTransformer(model_name, device=device)
+        self.query_prefix = query_prefix if query_prefix is not None else self._detect_query_prefix(model_name)
+        self.passage_prefix = passage_prefix if passage_prefix is not None else self._detect_passage_prefix(model_name)
 
         target = 512
         try:
@@ -784,12 +801,26 @@ class EmbeddingModel:
         self.model.tokenizer.model_max_length = target
         self.dim = self.model.get_embedding_dimension()
 
+    @staticmethod
+    def _detect_query_prefix(model_name: str) -> str:
+        name = model_name.lower()
+        if 'e5' in name:
+            return 'query: '
+        if 'bge' in name or 'bce' in name:
+            return 'Represent this sentence for searching relevant passages: '
+        return ''
+
+    @staticmethod
+    def _detect_passage_prefix(model_name: str) -> str:
+        name = model_name.lower()
+        if 'e5' in name:
+            return 'passage: '
+        return ''
+
     def embed(self, text: str) -> np.ndarray:
-        """Embed a single text."""
         return self.model.encode(text, normalize_embeddings=True)
 
     def embed_many(self, texts: list[str]) -> np.ndarray:
-        """Embed a list of texts."""
         return self.model.encode(texts, normalize_embeddings=True)
 
 
@@ -798,29 +829,37 @@ class VectorStore:
 
     def __init__(self):
         self.vectors: list[np.ndarray] = []
+        self._array_cache: np.ndarray | None = None
+        self._cached_len = 0
         self.texts: list[str] = []
         self.node_ids: list[int | None] = []
 
+    def _get_array(self) -> np.ndarray:
+        if len(self.vectors) != self._cached_len or self._array_cache is None:
+            self._array_cache = np.stack(self.vectors) if self.vectors else np.array([])
+            self._cached_len = len(self.vectors)
+        return self._array_cache
+
     def add(self, vec: np.ndarray, text: str, node_id: int | None = None) -> None:
-        """Add one vector-text pair."""
         self.vectors.append(vec)
         self.texts.append(text)
         self.node_ids.append(node_id)
+        self._array_cache = None
 
     def add_many(self, vecs: np.ndarray, texts: list[str], node_ids: list[int | None] | None = None) -> None:
-        """Add multiple vector-text pairs."""
         self.vectors.extend(vecs)
         self.texts.extend(texts)
         if node_ids is not None:
             self.node_ids.extend(node_ids)
         else:
             self.node_ids.extend([None] * len(texts))
+        self._array_cache = None
 
     def search(self, query_vec: np.ndarray, top_k: int = 5) -> list[dict]:
-        """Return top_k nearest items as [{text, score, idx, node_id, method}]."""
-        if not self.vectors:
+        array = self._get_array()
+        if array.size == 0:
             return []
-        scores = np.dot(np.stack(self.vectors), query_vec)
+        scores = np.dot(array, query_vec)
         top_idxs = np.argsort(scores)[-top_k:][::-1]
         return [
             {"text": self.texts[i], "score": float(scores[i]), "idx": i,
@@ -902,15 +941,22 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
             cfg = json.load(f)
         model_name = cfg.get("model_name", model_name)
         device = cfg.get("device")
+        query_prefix = cfg.get("query_prefix")
+        passage_prefix = cfg.get("passage_prefix")
     elif os.path.exists(embedder_cfg_path):
         with open(embedder_cfg_path) as f:
             ecfg = json.load(f)
         model_name = ecfg.get("model_name", model_name)
         device = ecfg.get("device")
+        query_prefix = ecfg.get("query_prefix")
+        passage_prefix = ecfg.get("passage_prefix")
+    else:
+        query_prefix = None
+        passage_prefix = None
 
-    # Initialize model and store
-    enc = EmbeddingModel(model_name, device=device)
-    store = VectorStore()
+    # Initialize model
+    enc = EmbeddingModel(model_name, device=device,
+                         query_prefix=query_prefix, passage_prefix=passage_prefix)
 
     project = root
     if delta:
@@ -929,7 +975,8 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
             return
 
         print(f"Delta: {len(changed)} changed files")
-        chunks = []
+        chunks: list[str] = []
+        strategy = ASTParser._load_strategy(project)
         for fp in changed:
             abspath = os.path.join(project, fp)
             if not os.path.isfile(abspath):
@@ -937,8 +984,20 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
             try:
                 file_chunks = ASTParser.parse_file(abspath, path_hint=fp)
                 if file_chunks:
-                    chunks.append(f"[file] {fp}")
-                    chunks.extend(file_chunks)
+                    for c in file_chunks:
+                        if isinstance(c, str):
+                            if c.startswith(tuple(ASTParser.SKIP_PREFIXES)):
+                                continue
+                            chunks.append(c)
+                        else:
+                            enriched = strategy.enrich(c)
+                            kind = c.get("kind", "")
+                            name = c.get("name", "")
+                            f = c.get("file", "")
+                            prefix = f"{kind} {f} {name}".strip()
+                            if prefix:
+                                enriched = f"{prefix} | {enriched}" if enriched else prefix
+                            chunks.append(enriched)
             except Exception as e:
                 chunks.append(f"[file] {fp} (read error: {e})")
 
@@ -949,12 +1008,12 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
                 json.dump({"files": changed, "texts": [], "model": model_name}, f)
             return
 
-        vecs = enc.embed_many(chunks)
-        store.add_many(vecs, chunks)
+        embed_texts = [enc.passage_prefix + c for c in chunks] if enc.passage_prefix else chunks
+        vecs = enc.embed_many(embed_texts)
 
         out_vec = os.path.join(project, data_dir, 'delta.npz')
         os.makedirs(os.path.dirname(out_vec), exist_ok=True)
-        StorageIO.save(out_vec, store.vectors, store.texts, enc.dim)
+        StorageIO.save(out_vec, vecs, chunks, enc.dim)
 
         delta_data = {
             "files": changed,
@@ -996,12 +1055,12 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
             except Exception as e:
                 print(f"  tree enrichment skipped: {e}")
 
-        vecs = enc.embed_many(chunks)
-        store.add_many(vecs, chunks)
+        embed_texts = [enc.passage_prefix + c for c in chunks] if enc.passage_prefix else chunks
+        vecs = enc.embed_many(embed_texts)
 
         out = os.path.join(project, data_dir, 'enriched_vectors.npz')
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        StorageIO.save(out, store.vectors, store.texts, enc.dim, node_ids=node_ids)
+        StorageIO.save(out, vecs, chunks, enc.dim, node_ids=node_ids)
         print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 
@@ -1027,9 +1086,12 @@ def _parse_file_worker(args):
                     flat_chunks.append(c)
                 else:
                     enriched = strategy.enrich(c)
-                    f = c.get("file")
-                    if f:
-                        enriched += f" ({f})"
+                    kind = c.get("kind", "")
+                    name = c.get("name", "")
+                    f = c.get("file", "")
+                    prefix = f"{kind} {f} {name}".strip()
+                    if prefix:
+                        enriched = f"{prefix} | {enriched}" if enriched else prefix
                     flat_chunks.append(enriched)
     except Exception:
         pass
@@ -1129,17 +1191,23 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     # Load model config
     model_name = "all-MiniLM-L6-v2"
     device = None
+    query_prefix = None
+    passage_prefix = None
     cfg_path = os.path.join(root, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             cfg = json.load(f)
         model_name = cfg.get("model_name", model_name)
         device = cfg.get("device")
+        query_prefix = cfg.get("query_prefix")
+        passage_prefix = cfg.get("passage_prefix")
     elif os.path.exists(embedder_cfg_path):
         with open(embedder_cfg_path) as f:
             ecfg = json.load(f)
         model_name = ecfg.get("model_name", model_name)
         device = ecfg.get("device")
+        query_prefix = ecfg.get("query_prefix")
+        passage_prefix = ecfg.get("passage_prefix")
 
     os.makedirs(data_dir, exist_ok=True)
     tree_json_path = os.path.join(data_dir, "tree_index.json")
@@ -1154,9 +1222,11 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     enc_gpu = None
     enc_cpu = None
     if embed_mode in ("multi", "gpu"):
-        enc_gpu = EmbeddingModel(model_name, device=device or "cuda")
+        enc_gpu = EmbeddingModel(model_name, device=device or "cuda",
+                                 query_prefix=query_prefix, passage_prefix=passage_prefix)
     if embed_mode in ("multi", "cpu"):
-        enc_cpu = EmbeddingModel(model_name, device="cpu")
+        enc_cpu = EmbeddingModel(model_name, device="cpu",
+                                 query_prefix=query_prefix, passage_prefix=passage_prefix)
 
     if tree_exists and os.path.exists(os.path.join(data_dir, "tree_vectors.npz")):
         print("Tree index exists, skipping tree embedding", flush=True)
@@ -1165,11 +1235,13 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         # Batch-embed tree texts (pre-allocated to avoid list-of-arrays)
         tree_vecs = np.array([])
         if tree_texts and enc_tree is not None:
+            prefix = enc_tree.passage_prefix
+            embed_texts = [prefix + t for t in tree_texts] if prefix else tree_texts
             dim = enc_tree.dim
-            n = len(tree_texts)
+            n = len(embed_texts)
             tree_vecs = np.empty((n, dim), dtype=np.float32)
             for i in range(0, n, BATCH):
-                batch = tree_texts[i:i + BATCH]
+                batch = embed_texts[i:i + BATCH]
                 tree_vecs[i:i + len(batch)] = enc_tree.embed_many(batch)
 
         # Save tree index
@@ -1220,13 +1292,16 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
             print(f"    [{min(i+BATCH, n)}/{n}]", flush=True)
         return out
 
+    prefix = (enc_gpu or enc_cpu).passage_prefix
+    embed_chunks = [prefix + c for c in chunks] if prefix else chunks
+
     if embed_mode == "multi":
         from concurrent.futures import ThreadPoolExecutor
         import threading
         import queue
         chunk_queue = queue.Queue()
-        for i in range(0, len(chunks), BATCH):
-            chunk_queue.put((i, chunks[i:i + BATCH]))
+        for i in range(0, len(embed_chunks), BATCH):
+            chunk_queue.put((i, embed_chunks[i:i + BATCH]))
         results = []
         results_lock = threading.Lock()
         _done = 0
@@ -1245,7 +1320,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
                 with results_lock:
                     results.append((idx, vecs))
                     _done += len(batch)
-                    print(f"    {name}: {_done}/{len(chunks)}", flush=True)
+                    print(f"    {name}: {_done}/{len(embed_chunks)}", flush=True)
                 chunk_queue.task_done()
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1255,15 +1330,15 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
                 pool.submit(_embed_worker, enc_cpu, "CPU")
         results.sort(key=lambda x: x[0])
         flat_dim = (enc_gpu or enc_cpu).dim
-        vecs = np.empty((len(chunks), flat_dim), dtype=np.float32)
+        vecs = np.empty((len(embed_chunks), flat_dim), dtype=np.float32)
         pos = 0
         for _, batch_vecs in results:
             vecs[pos:pos + len(batch_vecs)] = batch_vecs
             pos += len(batch_vecs)
     elif embed_mode == "gpu":
-        vecs = _embed_sequential(enc_gpu, chunks)
+        vecs = _embed_sequential(enc_gpu, embed_chunks)
     else:
-        vecs = _embed_sequential(enc_cpu, chunks)
+        vecs = _embed_sequential(enc_cpu, embed_chunks)
 
     out = os.path.join(data_dir, "enriched_vectors.npz")
     flat_dim = (enc_gpu or enc_cpu).dim

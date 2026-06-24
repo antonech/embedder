@@ -69,7 +69,7 @@ Source files (.py .cpp .js .ts .go .rs ...)
     ↓
 ASTParser (Python ast / libclang / tree-sitter)
     ↓
-EnrichmentStrategy chain (kind | name | signature | docstring)
+    EnrichmentStrategy chain (<kind> <file> <name> | signature | body | docstring)
     ↓
 EmbeddingModel → VectorStore → embedder_store/<project>/
                                     ↓
@@ -85,19 +85,33 @@ EmbeddingModel → VectorStore → embedder_store/<project>/
 
 ### Bi-encoder (embedding)
 
-Default: `all-MiniLM-L6-v2` (384-dim, English-optimized). Override in `config.json`.
+Default: `intfloat/e5-small-v2` (384-dim, English). Override `"model_name"` in `config.json`.
 
-Device: `"cpu"` (default) or `"cuda"`. Set `"device": "cuda"` in `config.json` to use GPU. Remove the line for auto-detect.
+Device: `"cpu"` (default) or `"cuda"`. Set `"device": "cuda"` in `config.json` to use GPU. Omit for auto-detect.
 
-Any sentence-transformers model works. Popular alternatives:
+Any sentence-transformers model works. The system auto-detects instruction prefix requirements:
+
+| Model family | Pattern | Prefix | Example |
+|---|---|---|---|
+| E5 (`intfloat/e5-*`, `intfloat/multilingual-e5-*`) | `query:` / `passage:` | Applied automatically | `e5-small-v2`, `multilingual-e5-small` |
+| BGE (`BAAI/bge-*`) | `Represent this sentence...` | Applied automatically | `bge-small-en-v1.5` |
+| Others (MiniLM, MPNet, etc.) | No prefix | Raw text | `all-MiniLM-L6-v2`, `all-mpnet-base-v2` |
+
+Override auto-detection with `"query_prefix"` / `"passage_prefix"` in config.
+
+Popular alternatives:
+- `all-MiniLM-L6-v2` — 384-dim, no prefix, fast, English (was the default)
 - `paraphrase-multilingual-MiniLM-L12-v2` — 384-dim, 50+ languages
 - `all-mpnet-base-v2` — higher quality, 768-dim, slower
-- `intfloat/multilingual-e5-small` — good multilingual, 384-dim
+- `intfloat/multilingual-e5-small` — 384-dim, multilingual, requires `passage:`/`query:` prefixes
+- `BAAI/bge-small-en-v1.5` — 384-dim, good for retrieval, uses `Represent this sentence...` prefix
+
+**Important:** When switching models, always rebuild the index — vector dimensions may differ.
 
 ### Cross-encoder (reranking)
 
 Optional reranker that re-scores the top retrieval candidates for better precision.
-Configured via `cross_encoder_model` in `config.json`. Recommended:
+Configured via `"cross_encoder_model"` in `config.json`. Recommended:
 
 - `cross-encoder/ms-marco-MiniLM-L-6-v2` — fast, good for code search
 
@@ -109,23 +123,26 @@ Usage: `search("query", rerank=True)` — defaults to auto (enabled if model loa
 
 ## Enrichment strategies
 
-Configured in `config.json` under `"enrichment"` key (array of strategy names):
-- `kind` — node type (class/function/method)
-- `name` — symbol name
-- `signature` — arguments and return type
-- `docstring` — doc comments
-- `body` — method body summary (first N lines)
+Configured in `config.json` under `"enrichment"` key (array of strategy names).
+Applied to each AST node to build the chunk text as `<kind> <file> <name> | <strategy fields...>`.
 
-Order matters: `["kind", "name", "signature", "docstring"]` produces e.g. `[CLASS] UserService | find(id) | Finds user by id`.
+Available strategies (order matters):
+- `signature` — arguments and return type
+- `body` — method body / fields / bases summary (first N lines)
+- `docstring` — doc comments
+- `kind` — node type (class/function/method; already in prefix)
+- `name` — symbol name (already in prefix)
+
+Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py UserService | find(id) | Methods: create, delete | Finds user by id`.
 
 ## Configuration (`config.json`)
 
 ```json
 {
-    "model_name": "all-MiniLM-L6-v2",
+    "model_name": "intfloat/e5-small-v2",
     "device": "cuda",
     "top_k": 5,
-    "enrichment": ["kind", "name", "signature", "body", "docstring"],
+    "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,
     "embedding_store": "~/project/embedder_store",
     "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
@@ -133,12 +150,13 @@ Order matters: `["kind", "name", "signature", "docstring"]` produces e.g. `[CLAS
 }
 ```
 
-- `model_name` — sentence-transformers model for embedding
+- `model_name` — sentence-transformers model (see [Models](#models) for compatible models)
 - `device` — `"cpu"`, `"cuda"`, or omit for auto-detect
 - `top_k` — default number of search results
-- `enrichment` — ordered list of strategy keys for flat chunk construction
+- `enrichment` — ordered list of strategy keys for flat chunk construction (default: `["signature", "body", "docstring"]`)
 - `use_clang` — enable libclang for C++ parsing (vs tree-sitter)
 - `embedding_store` — base directory for per-project indices (supports `~` and `$VAR` expansion)
+- `query_prefix` / `passage_prefix` — override auto-detected E5/BGE instruction prefixes (set to `""` to disable)
 - `cross_encoder_model` — optional cross-encoder model for reranking (e.g. `cross-encoder/ms-marco-MiniLM-L-6-v2`)
 - `cross_encoder_device` — device for cross-encoder (defaults to `device` value)
 
