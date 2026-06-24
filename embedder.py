@@ -837,11 +837,15 @@ class StorageIO:
     """Save/load vectors, texts, node_ids and dimension to/from .npz files."""
 
     @staticmethod
-    def save(path: str, vectors: list[np.ndarray], texts: list[str], dim: int,
+    def save(path: str, vectors: np.ndarray | list[np.ndarray], texts: list[str], dim: int,
              node_ids: list[int | None] | None = None) -> None:
+        if isinstance(vectors, list):
+            vecs_array = np.stack(vectors) if vectors else np.array([])
+        else:
+            vecs_array = np.asarray(vectors)
         data = {
             "dim": np.array(dim),
-            "vectors": np.stack(vectors) if vectors else np.array([]),
+            "vectors": vecs_array,
             "texts": np.array(texts, dtype=object),
         }
         if node_ids is not None:
@@ -1140,6 +1144,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     os.makedirs(data_dir, exist_ok=True)
     tree_json_path = os.path.join(data_dir, "tree_index.json")
     tree_exists = os.path.exists(tree_json_path)
+    BATCH = 1024
 
     # Phase 1: parse files (no GPU) — always needed for flat chunks
     all_tree_nodes, tree_texts, chunks = _parse_files(root, num_workers, exclude)
@@ -1156,19 +1161,24 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     if tree_exists and os.path.exists(os.path.join(data_dir, "tree_vectors.npz")):
         print("Tree index exists, skipping tree embedding", flush=True)
     else:
-        tree_store = VectorStore()
-        # Batch-embed tree texts
-        if tree_texts:
-            tree_vecs = enc_gpu.embed_many(tree_texts)
-            tree_store.add_many(tree_vecs, tree_texts)
+        enc_tree = enc_gpu or enc_cpu
+        # Batch-embed tree texts (pre-allocated to avoid list-of-arrays)
+        tree_vecs = np.array([])
+        if tree_texts and enc_tree is not None:
+            dim = enc_tree.dim
+            n = len(tree_texts)
+            tree_vecs = np.empty((n, dim), dtype=np.float32)
+            for i in range(0, n, BATCH):
+                batch = tree_texts[i:i + BATCH]
+                tree_vecs[i:i + len(batch)] = enc_tree.embed_many(batch)
 
         # Save tree index
         tree_vec_path = os.path.join(data_dir, "tree_vectors.npz")
-        if tree_store.vectors:
-            StorageIO.save(tree_vec_path, tree_store.vectors, tree_store.texts, enc_gpu.dim)
-            tree_data = {"nodes": all_tree_nodes, "texts": tree_store.texts}
+        if tree_vecs.size and enc_tree is not None:
+            StorageIO.save(tree_vec_path, tree_vecs, tree_texts, enc_tree.dim)
+            tree_data = {"nodes": all_tree_nodes, "texts": tree_texts}
             with open(tree_json_path, "w", encoding="utf8") as f:
-                json.dump(tree_data, f, ensure_ascii=False, indent=2)
+                json.dump(tree_data, f, ensure_ascii=False)
             print(f"Tree index: {len(all_tree_nodes)} nodes -> {tree_vec_path} + {tree_json_path}", flush=True)
         else:
             print("No tree nodes found")
@@ -1199,15 +1209,16 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
 
     # Flat chunk embedding
     print(f"  embedding {len(chunks)} flat chunks (mode={embed_mode})...", flush=True)
-    BATCH = 1024
 
     def _embed_sequential(model: EmbeddingModel, texts: list[str]):
-        out = []
-        for i in range(0, len(texts), BATCH):
+        dim = model.dim
+        n = len(texts)
+        out = np.empty((n, dim), dtype=np.float32)
+        for i in range(0, n, BATCH):
             batch = texts[i:i + BATCH]
-            out.append(model.embed_many(batch))
-            print(f"    [{min(i+BATCH, len(texts))}/{len(texts)}]", flush=True)
-        return np.concatenate(out) if out else np.array([])
+            out[i:i + len(batch)] = model.embed_many(batch)
+            print(f"    [{min(i+BATCH, n)}/{n}]", flush=True)
+        return out
 
     if embed_mode == "multi":
         from concurrent.futures import ThreadPoolExecutor
@@ -1218,8 +1229,10 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
             chunk_queue.put((i, chunks[i:i + BATCH]))
         results = []
         results_lock = threading.Lock()
+        _done = 0
 
         def _embed_worker(model: EmbeddingModel, name: str):
+            nonlocal _done
             import torch
             if name == "CPU":
                 torch.set_num_threads(10)
@@ -1231,23 +1244,30 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
                 vecs = model.embed_many(batch)
                 with results_lock:
                     results.append((idx, vecs))
-                    print(f"    {name}: {len(results)*BATCH}/{len(chunks)}", flush=True)
+                    _done += len(batch)
+                    print(f"    {name}: {_done}/{len(chunks)}", flush=True)
                 chunk_queue.task_done()
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            pool.submit(_embed_worker, enc_gpu, "GPU")
-            pool.submit(_embed_worker, enc_cpu, "CPU")
+            if enc_gpu is not None:
+                pool.submit(_embed_worker, enc_gpu, "GPU")
+            if enc_cpu is not None:
+                pool.submit(_embed_worker, enc_cpu, "CPU")
         results.sort(key=lambda x: x[0])
-        vecs = np.concatenate([v for _, v in results])
+        flat_dim = (enc_gpu or enc_cpu).dim
+        vecs = np.empty((len(chunks), flat_dim), dtype=np.float32)
+        pos = 0
+        for _, batch_vecs in results:
+            vecs[pos:pos + len(batch_vecs)] = batch_vecs
+            pos += len(batch_vecs)
     elif embed_mode == "gpu":
         vecs = _embed_sequential(enc_gpu, chunks)
     else:
         vecs = _embed_sequential(enc_cpu, chunks)
 
-    flat_store = VectorStore()
-    flat_store.add_many(vecs, chunks)
     out = os.path.join(data_dir, "enriched_vectors.npz")
-    StorageIO.save(out, flat_store.vectors, flat_store.texts, enc_gpu.dim, node_ids=node_ids)
+    flat_dim = (enc_gpu or enc_cpu).dim
+    StorageIO.save(out, vecs, chunks, flat_dim, node_ids=node_ids)
     print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 

@@ -83,7 +83,7 @@ class EmbedderApp:
     def load_delta(self, data_path: str) -> str:
         if not os.path.exists(data_path):
             return "No delta file"
-        vecs, texts, dim = StorageIO.load(data_path)
+        vecs, texts, dim, _ = StorageIO.load(data_path)
         self.store.vectors.extend(vecs)
         self.store.texts.extend(texts)
         self._delta_count = len(vecs)

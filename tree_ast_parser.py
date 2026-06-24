@@ -1,8 +1,8 @@
-import os, json, glob
+import os, json, subprocess
 
 from tree_sitter import Language, Parser
 import tree_sitter_python, tree_sitter_cpp, tree_sitter_bash
-from embedder import EmbeddingModel, VectorStore, StorageIO
+from embedder import EmbeddingModel, VectorStore, StorageIO, ASTParser
 
 
 LANGUAGES = {
@@ -258,9 +258,14 @@ def build_index(root=".", data_dir=None, exclude={"/venv/", "/__pycache__/", "/.
     all_nodes = []
 
     exts = tuple(LANGUAGES.keys())
-    files = glob.glob(f"{root}/**/*", recursive=True)
-    files = [f for f in files if os.path.isfile(f) and f.endswith(exts)]
-    files = [f for f in files if not any(x in f for x in exclude)]
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ASTParser.SKIP_DIRS]
+        if any(x in dirpath for x in exclude):
+            continue
+        for fn in sorted(filenames):
+            if fn.endswith(exts):
+                files.append(os.path.join(dirpath, fn))
 
     next_id = [0]
     for fp in sorted(files):
@@ -337,7 +342,7 @@ def build_delta(root=".", data_dir=None, exclude={"/venv/", "/__pycache__/", "/.
 
 
 if __name__ == "__main__":
-    import argparse, subprocess
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".")
     parser.add_argument("--data-dir", default=None)
