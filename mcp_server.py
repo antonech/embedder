@@ -294,8 +294,8 @@ class EmbedderApp:
         prefixed = self.encoder.query_prefix + query if self.encoder.query_prefix else query
         return self.encoder.embed(prefixed)
 
-    def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool | None = None) -> str:
-        do_rerank = rerank if rerank is not None else (self.cross_encoder is not None)
+    def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
+        do_rerank = rerank and self.cross_encoder is not None
         qv = self._embed_query(query)
 
         if mode == "embed":
@@ -420,7 +420,7 @@ mcp = FastMCP("embedder")
 
 
 @mcp.tool()
-def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool | None = None) -> str:
+def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
     """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7). rerank=True uses cross-encoder. Includes AST context."""
     global projects
     if not projects:
