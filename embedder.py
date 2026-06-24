@@ -1209,6 +1209,19 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         query_prefix = ecfg.get("query_prefix")
         passage_prefix = ecfg.get("passage_prefix")
 
+    # Infer mode from device
+    if embed_mode is None:
+        if device == "gpu":
+            embed_mode = "gpu"
+            device = None
+        elif device and device.startswith("cuda"):
+            embed_mode = "multi"
+        elif device == "cpu":
+            embed_mode = "cpu"
+        else:
+            import torch
+            embed_mode = "multi" if torch.cuda.is_available() else "cpu"
+
     os.makedirs(data_dir, exist_ok=True)
     tree_json_path = os.path.join(data_dir, "tree_index.json")
     tree_exists = os.path.exists(tree_json_path)
@@ -1354,7 +1367,7 @@ if __name__ == "__main__":
     parser.add_argument('--data-dir', default=None, help='Directory to save the index (default: from config)')
     parser.add_argument('--root', default='.', help='Project root directory')
     parser.add_argument('--workers', type=int, default=10, help='Number of worker processes for file parsing (default: 10)')
-    parser.add_argument('--embed-mode', choices=['multi', 'gpu', 'cpu'], default='multi',
+    parser.add_argument('--embed-mode', choices=['multi', 'gpu', 'cpu'], default=None,
                         help='Embedding mode: multi (GPU+CPU, default), gpu-only, cpu-only')
     args = parser.parse_args()
 

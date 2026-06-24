@@ -87,7 +87,7 @@ EmbeddingModel → VectorStore → embedder_store/<project>/
 
 Default: `intfloat/e5-small-v2` (384-dim, English). Override `"model_name"` in `config.json`.
 
-Device: `"cpu"` (default) or `"cuda"`. Set `"device": "cuda"` in `config.json` to use GPU. Omit for auto-detect.
+Device options: `"cuda"`, `"cuda:N"`, `"cpu"`, or omit for auto-detect. See [Configuration](#configuration-configjson).
 
 Any sentence-transformers model works. The system auto-detects instruction prefix requirements:
 
@@ -151,7 +151,11 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
 ```
 
 - `model_name` — sentence-transformers model (see [Models](#models) for compatible models)
-- `device` — `"cpu"`, `"cuda"`, or omit for auto-detect
+- `device` — controls GPU device and embedding mode:
+  - `"cuda"` / `"cuda:0"` / `"cuda:1"` — GPU + CPU workers in parallel (`multi` mode)
+  - `"gpu"` — GPU only (no CPU worker), auto-detects device
+  - `"cpu"` — CPU only
+  - omit — auto-detect: `"multi"` if CUDA available, else `"cpu"`; CLI `--embed-mode` overrides
 - `top_k` — default number of search results
 - `enrichment` — ordered list of strategy keys for flat chunk construction (default: `["signature", "body", "docstring"]`)
 - `use_clang` — enable libclang for C++ parsing (vs tree-sitter)
