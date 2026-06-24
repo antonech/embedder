@@ -1211,11 +1211,8 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
 
     # Infer mode from device
     if embed_mode is None:
-        if device == "gpu":
+        if device and device.startswith("cuda"):
             embed_mode = "gpu"
-            device = None
-        elif device and device.startswith("cuda"):
-            embed_mode = "multi"
         elif device == "cpu":
             embed_mode = "cpu"
         else:
