@@ -1359,7 +1359,6 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
             pool.shutdown()
         except KeyboardInterrupt:
             print("\nInterrupted, exiting...", flush=True)
-            import os
             os._exit(0)
         results.sort(key=lambda x: x[0])
         flat_dim = (enc_gpu or enc_cpu).dim
