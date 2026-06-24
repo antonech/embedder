@@ -785,8 +785,11 @@ class EmbeddingModel:
     """Wraps a SentenceTransformer model for producing embeddings."""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = None,
-                 query_prefix: str | None = None, passage_prefix: str | None = None):
+                 query_prefix: str | None = None, passage_prefix: str | None = None,
+                 float_type: str = "fp32"):
         self.model = SentenceTransformer(model_name, device=device)
+        if float_type == "fp16":
+            self.model.half()
         self.query_prefix = query_prefix if query_prefix is not None else self._detect_query_prefix(model_name)
         self.passage_prefix = passage_prefix if passage_prefix is not None else self._detect_passage_prefix(model_name)
 
@@ -938,6 +941,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
     query_prefix = None
     passage_prefix = None
     batch_size = 1024
+    float_type = "fp32"
     cfg_path = os.path.join(root, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
@@ -947,6 +951,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         query_prefix = cfg.get("query_prefix")
         passage_prefix = cfg.get("passage_prefix")
         batch_size = cfg.get("batch_size", batch_size)
+        float_type = cfg.get("float_type", float_type)
     elif os.path.exists(embedder_cfg_path):
         with open(embedder_cfg_path) as f:
             ecfg = json.load(f)
@@ -955,10 +960,12 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         query_prefix = ecfg.get("query_prefix")
         passage_prefix = ecfg.get("passage_prefix")
         batch_size = ecfg.get("batch_size", batch_size)
+        float_type = ecfg.get("float_type", float_type)
 
     # Initialize model
     enc = EmbeddingModel(model_name, device=device,
-                         query_prefix=query_prefix, passage_prefix=passage_prefix)
+                         query_prefix=query_prefix, passage_prefix=passage_prefix,
+                         float_type=float_type)
 
     project = root
     if delta:
@@ -1196,6 +1203,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     query_prefix = None
     passage_prefix = None
     batch_size = 1024
+    float_type = "fp32"
     cfg_path = os.path.join(root, "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
@@ -1205,6 +1213,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         query_prefix = cfg.get("query_prefix")
         passage_prefix = cfg.get("passage_prefix")
         batch_size = cfg.get("batch_size", batch_size)
+        float_type = cfg.get("float_type", float_type)
     elif os.path.exists(embedder_cfg_path):
         with open(embedder_cfg_path) as f:
             ecfg = json.load(f)
@@ -1213,6 +1222,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         query_prefix = ecfg.get("query_prefix")
         passage_prefix = ecfg.get("passage_prefix")
         batch_size = ecfg.get("batch_size", batch_size)
+        float_type = ecfg.get("float_type", float_type)
 
     # Infer mode from device
     if embed_mode is None:
@@ -1238,10 +1248,12 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     enc_cpu = None
     if embed_mode in ("multi", "gpu"):
         enc_gpu = EmbeddingModel(model_name, device=device or "cuda",
-                                 query_prefix=query_prefix, passage_prefix=passage_prefix)
+                                 query_prefix=query_prefix, passage_prefix=passage_prefix,
+                                 float_type=float_type)
     if embed_mode in ("multi", "cpu"):
         enc_cpu = EmbeddingModel(model_name, device="cpu",
-                                 query_prefix=query_prefix, passage_prefix=passage_prefix)
+                                 query_prefix=query_prefix, passage_prefix=passage_prefix,
+                                 float_type=float_type)
 
     if tree_exists and os.path.exists(os.path.join(data_dir, "tree_vectors.npz")):
         print("Tree index exists, skipping tree embedding", flush=True)

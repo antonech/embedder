@@ -15,6 +15,7 @@ class EmbedderApp:
         data_dir: str = "data", device: str | None = None,
         cross_encoder_model: str | None = None,
         cross_encoder_device: str | None = None,
+        float_type: str = "fp32",
     ):
         self.project_name = project_name
         self.model_name = model_name
@@ -28,7 +29,7 @@ class EmbedderApp:
                 device = "cpu"
         self.device = device
         self.data_dir = data_dir
-        self.encoder = EmbeddingModel(model_name, device=device)
+        self.encoder = EmbeddingModel(model_name, device=device, float_type=float_type)
         self.store = VectorStore()
         self._bm25 = None
         self.cross_encoder = None
@@ -550,6 +551,7 @@ async def main():
     data_dir = "data"
     cross_encoder_model = None
     cross_encoder_device = None
+    float_type = "fp32"
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cfg_path = os.path.join(script_dir, "config.json")
     if os.path.exists(cfg_path):
@@ -560,6 +562,7 @@ async def main():
         store_root = cfg.get("embedding_store", "")
         cross_encoder_model = cfg.get("cross_encoder_model")
         cross_encoder_device = device  # derived from device
+        float_type = cfg.get("float_type", float_type)
         if store_root:
             store_root = os.path.expandvars(os.path.expanduser(store_root))
 
@@ -573,6 +576,7 @@ async def main():
             project_name, model_name, data_dir=data_dir, device=device,
             cross_encoder_model=cross_encoder_model,
             cross_encoder_device=cross_encoder_device,
+            float_type=float_type,
         )
 
     app = projects[project_name]
