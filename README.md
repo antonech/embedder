@@ -140,7 +140,7 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
 ```json
 {
     "model_name": "intfloat/e5-small-v2",
-    "device": "cuda",
+    // "device": "cuda",       // uncomment for GPU-only; omit for auto multi (GPU+CPU) or CPU
     "top_k": 5,
     "enrichment": ["signature", "body", "docstring"],
     "use_clang": true,
@@ -151,10 +151,10 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
 ```
 
 - `model_name` — sentence-transformers model (see [Models](#models) for compatible models)
-- `device` — controls where embedding runs:
+- `device` — controls where embedding runs (omit for auto):
   - `"cuda"` / `"cuda:0"` / `"cuda:1"` — GPU only
   - `"cpu"` — CPU only
-  - omit — auto-detect: GPU + CPU parallel (`multi`) if CUDA available, else `"cpu"`; CLI `--embed-mode` overrides
+  - omitted — auto-detect: GPU + CPU parallel (`multi`) if CUDA available, else `"cpu"`; CLI `--embed-mode` overrides
 - `top_k` — default number of search results
 - `enrichment` — ordered list of strategy keys for flat chunk construction (default: `["signature", "body", "docstring"]`)
 - `use_clang` — enable libclang for C++ parsing (vs tree-sitter)
