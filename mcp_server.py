@@ -291,7 +291,7 @@ class EmbedderApp:
         if mode == "bm25" or alpha <= 0.0:
             return self._bm25_hits(bm25_raw, bm25_top, top_k)
         if alpha >= 1.0:
-            return [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
+            return self.store.search(qv, top_k=top_k)
 
         emb_hits = self.store.search(qv, top_k=top_k * 3)
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
@@ -456,8 +456,6 @@ def clear_delta(project: str) -> str:
 
 
 async def main():
-    global projects
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--project", help="Project name (default: basename of workdir)")
     args = parser.parse_args()
