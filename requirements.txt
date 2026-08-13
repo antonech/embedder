@@ -1,6 +1,7 @@
 sentence-transformers>=5.0
 numpy
-mcp>=1.0
+mcp>=1.0,<2
+rank-bm25>=0.2.2
 tree-sitter>=0.25
 tree-sitter-python>=0.25
 tree-sitter-cpp>=0.23
