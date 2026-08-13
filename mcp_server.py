@@ -5,6 +5,7 @@ import argparse
 import re
 import numpy as np
 from mcp.server.fastmcp import FastMCP
+from common import ModelConfig, project_data_dir, resolve_device
 from embedder import EmbeddingModel, StorageIO, VectorStore
 from tree_search import TreeIndex
 
@@ -19,14 +20,7 @@ class EmbedderApp:
     ):
         self.project_name = project_name
         self.model_name = model_name
-        # Handle CUDA fallback
-        if device == "cuda":
-            try:
-                import torch
-                if not torch.cuda.is_available():
-                    device = "cpu"
-            except ImportError:
-                device = "cpu"
+        device = resolve_device(device)
         self.device = device
         self.data_dir = data_dir
         self.encoder = EmbeddingModel(model_name, device=device, float_type=float_type)
@@ -37,11 +31,7 @@ class EmbedderApp:
         if cross_encoder_model:
             try:
                 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-                ce_dev = cross_encoder_device or device or "cpu"
-                if ce_dev == "cuda":
-                    import torch
-                    if not torch.cuda.is_available():
-                        ce_dev = "cpu"
+                ce_dev = resolve_device(cross_encoder_device or device) or "cpu"
                 self.cross_encoder_tokenizer = AutoTokenizer.from_pretrained(cross_encoder_model)
                 self.cross_encoder = AutoModelForSequenceClassification.from_pretrained(
                     cross_encoder_model
@@ -183,32 +173,7 @@ class EmbedderApp:
         return merged[:top_k]
 
     def _annotate(self, hits: list[dict]) -> list[dict]:
-        tree = self._get_tree()
-        for h in hits:
-            nid = h.get("node_id")
-            if nid is not None:
-                n = tree.get_node(nid)
-            else:
-                n = tree.match_node(h.get("text", ""))
-            if not n:
-                continue
-            uid = n["_uid"]
-            h["context"] = {
-                "children": [
-                    {"name": c["name"], "type": c["type"], "file": c["file"],
-                     "lines": f"{c['start_line']}-{c['end_line']}"}
-                    for c in tree.get_children(uid)
-                ],
-                "parent": None,
-                "siblings": [
-                    {"name": s["name"], "type": s["type"]}
-                    for s in tree.get_siblings(uid)
-                ],
-            }
-            p = tree.get_parent(uid)
-            if p:
-                h["context"]["parent"] = {"name": p["name"], "type": p["type"]}
-        return hits
+        return self._get_tree().annotate(hits)
 
     def _rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
         if not hits or self.cross_encoder is None:
@@ -291,66 +256,42 @@ class EmbedderApp:
         return expanded
 
     def _embed_query(self, query: str) -> np.ndarray:
-        prefixed = self.encoder.query_prefix + query if self.encoder.query_prefix else query
-        return self.encoder.embed(prefixed)
+        return self.encoder.embed_query(query)
 
-    def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
-        do_rerank = rerank and self.cross_encoder is not None
-        qv = self._embed_query(query)
+    def _bm25_hits(self, bm25_raw, bm25_top: list[int], top_k: int) -> list[dict]:
+        """Top BM25 documents with scores min-max normalized over the returned window."""
+        top_idxs = bm25_top[:top_k]
+        top_scores = [bm25_raw[i] for i in top_idxs]
+        min_b, max_b = min(top_scores), max(top_scores)
+        return [
+            {"text": self.store.texts[i],
+             "score": (float(bm25_raw[i]) - min_b) / (max_b - min_b) if max_b > min_b else 0.5,
+             "idx": i, "method": "bm25"}
+            for i in top_idxs
+        ]
 
-        if mode == "embed":
-            hits = self.store.search(qv, top_k=top_k)
-            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-            if do_rerank:
-                hits = self._rerank(query, hits, top_k)
-            return self._format(self._annotate(hits), fmt)
+    def _finalize(self, query: str, hits: list[dict], qv, top_k: int, fmt: str, do_rerank: bool) -> str:
+        """Tree fusion → optional reranking → AST annotation → formatting."""
+        hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+        if do_rerank:
+            hits = self._rerank(query, hits, top_k)
+        return self._format(self._annotate(hits), fmt)
 
-        if self._bm25 is None:
-            hits = self.store.search(qv, top_k=top_k)
-            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-            if do_rerank:
-                hits = self._rerank(query, hits, top_k)
-            return self._format(self._annotate(hits), fmt)
+    def _candidates(self, query: str, qv, top_k: int, mode: str, alpha: float | None) -> list[dict]:
+        if mode == "embed" or self._bm25 is None:
+            return self.store.search(qv, top_k=top_k)
+
         tokenized = self._expand_query(query, qv, top_k=top_k)
         n = len(self.store)
         bm25_raw = self._bm25.get_scores(tokenized)
         bm25_top = sorted(range(n), key=lambda i: bm25_raw[i], reverse=True)[:top_k * 3]
 
-        if mode == "bm25":
-            top_scores = [bm25_raw[i] for i in bm25_top[:top_k]]
-            min_b, max_b = min(top_scores), max(top_scores)
-            hits = [
-                {"text": self.store.texts[i],
-                 "score": (float(bm25_raw[i]) - min_b) / (max_b - min_b) if max_b > min_b else 0.5,
-                 "idx": i, "method": "bm25"}
-                for i in bm25_top[:top_k]
-            ]
-            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-            if do_rerank:
-                hits = self._rerank(query, hits, top_k)
-            return self._format(self._annotate(hits), fmt)
-
         if alpha is None:
             alpha = 0.7
+        if mode == "bm25" or alpha <= 0.0:
+            return self._bm25_hits(bm25_raw, bm25_top, top_k)
         if alpha >= 1.0:
-            hits = [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
-            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-            if do_rerank:
-                hits = self._rerank(query, hits, top_k)
-            return self._format(self._annotate(hits), fmt)
-        if alpha <= 0.0:
-            top_scores = [bm25_raw[i] for i in bm25_top[:top_k]]
-            min_b, max_b = min(top_scores), max(top_scores)
-            hits = [
-                {"text": self.store.texts[i],
-                 "score": (float(bm25_raw[i]) - min_b) / (max_b - min_b) if max_b > min_b else 0.5,
-                 "idx": i, "method": "bm25"}
-                for i in bm25_top[:top_k]
-            ]
-            hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-            if do_rerank:
-                hits = self._rerank(query, hits, top_k)
-            return self._format(self._annotate(hits), fmt)
+            return [dict(**h, method="embed") for h in self.store.search(qv, top_k=top_k)]
 
         emb_hits = self.store.search(qv, top_k=top_k * 3)
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
@@ -370,17 +311,18 @@ class EmbedderApp:
             b = (cand_bm25[doc_id] - min_b) / (max_b - min_b) if max_b > min_b else 0.5
             return alpha * rrf + (1 - alpha) * b
 
-        scored = [(doc_id, blend(doc_id)) for doc_id in candidates]
-        scored.sort(key=lambda x: -x[1])
-        hits = [
+        scored = sorted(((doc_id, blend(doc_id)) for doc_id in candidates), key=lambda x: -x[1])
+        return [
             {"text": self.store.texts[idx], "score": round(s, 4), "idx": idx,
              "method": "hybrid"}
             for idx, s in scored[:top_k]
         ]
-        hits = self._fuse_with_tree(hits, qv, top_k=top_k)
-        if do_rerank:
-            hits = self._rerank(query, hits, top_k)
-        return self._format(self._annotate(hits), fmt)
+
+    def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
+        do_rerank = rerank and self.cross_encoder is not None
+        qv = self._embed_query(query)
+        hits = self._candidates(query, qv, top_k, mode, alpha)
+        return self._finalize(query, hits, qv, top_k, fmt, do_rerank)
 
     def embed(self, text: str) -> list[float]:
         return self.encoder.embed(text).tolist()
@@ -389,17 +331,11 @@ class EmbedderApp:
         return self.encoder.embed_many(texts).tolist()
 
     def add_document(self, text: str) -> str:
-        prefixed = self.encoder.passage_prefix + text if self.encoder.passage_prefix else text
-        vec = self.encoder.embed(prefixed)
-        self.store.add(vec, text)
+        self.store.add(self.encoder.embed_passage(text), text)
         return f"Added, total vectors: {len(self.store)}"
 
     def add_documents(self, texts: list[str]) -> str:
-        if self.encoder.passage_prefix:
-            prefixed = [self.encoder.passage_prefix + t for t in texts]
-        else:
-            prefixed = texts
-        vecs = self.encoder.embed_many(prefixed)
+        vecs = self.encoder.embed_many(self.encoder.as_passages(texts))
         self.store.add_many(vecs, texts)
         return f"Added {len(texts)} docs, total vectors: {len(self.store)}"
 
@@ -419,124 +355,104 @@ projects: dict[str, EmbedderApp] = {}
 mcp = FastMCP("embedder")
 
 
+def _resolve(project: str) -> tuple[EmbedderApp | None, str | None]:
+    """Look up a loaded project, returning (app, error_message)."""
+    if not projects:
+        return None, "Error: server not initialized"
+    app = projects.get(project)
+    if app is None:
+        return None, f"Error: project '{project}' not found"
+    return app, None
+
+
 @mcp.tool()
 def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
     """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7). rerank=True uses cross-encoder. Includes AST context."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.search(query, top_k=top_k, mode=mode, alpha=alpha, fmt=fmt, rerank=rerank)
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.search(query, top_k=top_k, mode=mode, alpha=alpha, fmt=fmt, rerank=rerank)
 
 
 @mcp.tool()
 def embed(text: str, project: str) -> str:
     """Embed a single text into a vector."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return json.dumps(target_app.embed(text))
+    app, err = _resolve(project)
+    if err:
+        return err
+    return json.dumps(app.embed(text))
 
 
 @mcp.tool()
 def embed_many(texts: list[str], project: str) -> str:
     """Embed multiple texts into vectors."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return json.dumps(target_app.embed_many(texts))
+    app, err = _resolve(project)
+    if err:
+        return err
+    return json.dumps(app.embed_many(texts))
 
 
 @mcp.tool()
 def store_info(project: str) -> str:
     """Return store statistics and sample texts."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.info()
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.info()
 
 
 @mcp.tool()
 def init_store(data_path: str, project: str) -> str:
     """Load vectors from a saved .npz file into the store."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.init(data_path)
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.init(data_path)
 
 
 @mcp.tool()
 def add_document(text: str, project: str) -> str:
     """Add a single document: embed it and store."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.add_document(text)
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.add_document(text)
 
 
 @mcp.tool()
 def add_documents(texts: list[str], project: str) -> str:
     """Add multiple documents at once."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.add_documents(texts)
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.add_documents(texts)
 
 
 @mcp.tool()
 def save_store(path: str, project: str) -> str:
     """Save current store to a .npz file."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.save(path)
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.save(path)
 
 
 @mcp.tool()
 def load_delta(data_path: str, project: str) -> str:
     """Load delta vectors on top of the existing store."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.load_delta(data_path)
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.load_delta(data_path)
 
 
 @mcp.tool()
 def clear_delta(project: str) -> str:
     """Remove delta layer from the store."""
-    global projects
-    if not projects:
-        return "Error: server not initialized"
-    target_app = projects.get(project)
-    if target_app is None:
-        return f"Error: project '{project}' not found"
-    return target_app.clear_delta()
+    app, err = _resolve(project)
+    if err:
+        return err
+    return app.clear_delta()
 
 
 async def main():
@@ -546,37 +462,16 @@ async def main():
     parser.add_argument("--project", help="Project name (default: basename of workdir)")
     args = parser.parse_args()
 
-    model_name = "all-MiniLM-L6-v2"
-    device = None
-    data_dir = "data"
-    cross_encoder_model = None
-    cross_encoder_device = None
-    float_type = "fp32"
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    cfg_path = os.path.join(script_dir, "config.json")
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        model_name = cfg.get("model_name", model_name)
-        device = cfg.get("device")
-        store_root = cfg.get("embedding_store", "")
-        cross_encoder_model = cfg.get("cross_encoder_model")
-        cross_encoder_device = device  # derived from device
-        float_type = cfg.get("float_type", float_type)
-        if store_root:
-            store_root = os.path.expandvars(os.path.expanduser(store_root))
-
+    cfg = ModelConfig.load()
     project_name = args.project or os.path.basename(os.getcwd())
-
-    if store_root:
-        data_dir = os.path.join(store_root, project_name)
+    data_dir = project_data_dir(project_name)
 
     if project_name not in projects:
         projects[project_name] = EmbedderApp(
-            project_name, model_name, data_dir=data_dir, device=device,
-            cross_encoder_model=cross_encoder_model,
-            cross_encoder_device=cross_encoder_device,
-            float_type=float_type,
+            project_name, cfg.model_name, data_dir=data_dir, device=cfg.device,
+            cross_encoder_model=cfg.cross_encoder_model,
+            cross_encoder_device=cfg.device,
+            float_type=cfg.float_type,
         )
 
     app = projects[project_name]
