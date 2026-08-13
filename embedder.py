@@ -1,9 +1,16 @@
-import os, json, ast, re as _re, subprocess, argparse, sys
+import os, json, ast, re as _re, argparse, sys
 
 import numpy as np
 from typing import Optional
 from abc import ABC, abstractmethod
 from sentence_transformers import SentenceTransformer
+
+from common import (
+    DEFAULT_EXCLUDE, LABELS as _LABELS, ModelConfig,
+    SKIP_DIRS as _SKIP_DIRS, SKIP_PREFIXES as _SKIP_PREFIXES,
+    add_tree_context, changed_files, enrich_chunks, label_for, load_json,
+    node_text, resolve_data_dir, ts_base_classes, ts_body_summary,
+)
 
 try:
     from tree_sitter import Language, Parser
@@ -23,35 +30,26 @@ _TS_LANGUAGES = {
     ".rs":  ("rust", tree_sitter_rust.language),
 } if _TS_AVAILABLE else {}
 
-    # --- Clang support (optional) ---
-_CLANG_AVAILABLE = False
-_USE_CLANG = False  # can be enabled via config.json
+# --- Clang support (optional) ---
+_CLANG_LIB_PATHS = ['/usr/lib/llvm-18/lib', '/usr/lib/llvm-15/lib', '/usr/lib/x86_64-linux-gnu']
+
+
+def _configure_clang(ci_module) -> None:
+    """Point libclang at the first library path that accepts it."""
+    for libpath in _CLANG_LIB_PATHS:
+        try:
+            ci_module.Config.set_library_path(libpath)
+            break
+        except Exception:
+            pass
+
+
 try:
     import clang.cindex as ci
-    # Try to set the library path to common locations
-    for libpath in ['/usr/lib/llvm-18/lib', '/usr/lib/llvm-15/lib', '/usr/lib/x86_64-linux-gnu']:
-        try:
-            ci.Config.set_library_path(libpath)
-            break
-        except:
-            pass
+    _configure_clang(ci)
     _CLANG_AVAILABLE = True
-    # Define significant cursor kinds for clang (if available)
-    _CLANG_SIGNIFICANT = {
-        ci.CursorKind.CLASS_DECL,
-        ci.CursorKind.STRUCT_DECL,
-        ci.CursorKind.UNION_DECL,
-        ci.CursorKind.CXX_METHOD,
-        ci.CursorKind.CONSTRUCTOR,
-        ci.CursorKind.FUNCTION_DECL,
-        ci.CursorKind.FUNCTION_TEMPLATE,
-        ci.CursorKind.ENUM_DECL,
-        ci.CursorKind.TYPEDEF_DECL,
-        ci.CursorKind.TYPE_ALIAS_DECL,
-    }
 except Exception:
     _CLANG_AVAILABLE = False
-    _CLANG_SIGNIFICANT = set()
 
 _TS_SIGNIFICANT = {
     "javascript": {
@@ -202,13 +200,6 @@ class CompositeStrategy(EnrichmentStrategy):
         return cls.from_keys(["kind", "name", "signature", "docstring"])
 
 
-_LABELS_PATH = os.path.join(os.path.dirname(__file__), "labels.json")
-if os.path.exists(_LABELS_PATH):
-    with open(_LABELS_PATH) as f:
-        _LABELS = json.load(f)
-else:
-    _LABELS = {"default": {"file": "[file]", "line": "[line]", "fallback": "[chank]"}, "mapping": {}}
-
 class ASTParser:
     """Extract enriched chunks from source files for any language.
 
@@ -217,11 +208,10 @@ class ASTParser:
     registering a handler: ASTParser.register('*.ext', handler_fn).
     """
 
-    SKIP_DIRS = {'venv', '.git', '__pycache__', 'node_modules'}
-    SKIP_PREFIXES = {'[line]', '[file]'}
+    SKIP_DIRS = _SKIP_DIRS
+    SKIP_PREFIXES = _SKIP_PREFIXES
 
     _handlers: dict[str, callable] = {}
-    _use_clang = False  # class variable, set by scan_project from config
 
     # --- Clang significant cursor kinds (if clang available) ---
     if _CLANG_AVAILABLE:
@@ -264,25 +254,10 @@ class ASTParser:
 
     @classmethod
     def _load_strategy(cls, root: str, enrichment_keys: Optional[list[str]] = None) -> CompositeStrategy:
+        cfg = load_json(os.path.join(root, "config.json"))
+        cls._use_clang = cfg.get("use_clang", False)
         if enrichment_keys is None:
-            cfg_path = os.path.join(root, "config.json")
-            if os.path.exists(cfg_path):
-                with open(cfg_path) as f:
-                    cfg = json.load(f)
-                enrichment_keys = cfg.get("enrichment")
-                # Set the use_clang flag from config
-                cls._use_clang = cfg.get("use_clang", False)
-            else:
-                cls._use_clang = False
-        else:
-            # If enrichment_keys is provided, we still set the flag from config if available
-            cfg_path = os.path.join(root, "config.json")
-            if os.path.exists(cfg_path):
-                with open(cfg_path) as f:
-                    cfg = json.load(f)
-                cls._use_clang = cfg.get("use_clang", False)
-            else:
-                cls._use_clang = False
+            enrichment_keys = cfg.get("enrichment")
         return CompositeStrategy.from_keys(enrichment_keys or ["signature", "body", "docstring"])
 
     @classmethod
@@ -296,7 +271,6 @@ class ASTParser:
         """
         chunks = []
         strategy = cls._load_strategy(root, enrichment_keys)
-        file_label = _LABELS["default"].get("file", "[file]")
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in cls.SKIP_DIRS]
             for fn in sorted(filenames):
@@ -304,23 +278,8 @@ class ASTParser:
                 name = os.path.relpath(fp, root)
                 # Parse every file; unregistered types (XML, .sh, .md) use fallback
                 try:
-                    file_chunks = cls.parse_file(fp, path_hint=name)
-                    if file_chunks:
-                        for c in file_chunks:
-                            if isinstance(c, str):
-                                if c.startswith(tuple(cls.SKIP_PREFIXES)):
-                                    continue
-                                chunks.append(c)
-                            else:
-                                enriched = strategy.enrich(c)
-                                kind = c.get("kind", "")
-                                name = c.get("name", "")
-                                f = c.get("file", "")
-                                prefix = f"{kind} {f} {name}".strip()
-                                if prefix:
-                                    enriched = f"{prefix} | {enriched}" if enriched else prefix
-                                chunks.append(enriched)
-                except Exception as e:
+                    chunks.extend(enrich_chunks(cls.parse_file(fp, path_hint=name), strategy))
+                except Exception:
                     pass
         return chunks
 
@@ -374,7 +333,6 @@ class ASTParser:
 
     # --- Fallback: line-based chunking ---
 
-    @classmethod
     @classmethod
     def _parse_fallback(cls, source: str, path_hint: str = "", label: str = "") -> list[dict | str]:
         chunks: list[dict | str] = []
@@ -437,127 +395,10 @@ class ASTParser:
             tree = parser.parse(source.encode("utf8", errors="ignore"))
             root = tree.root_node
 
-            def _ts_base_classes(n):
-                bases = []
-                for c in n.children:
-                    if c.type == "base_class_clause":
-                        for cc in c.children:
-                            if cc.type == "type_identifier":
-                                bases.append(cc.text.decode("utf8", errors="ignore"))
-                if bases:
-                    return ": " + ", ".join(bases)
-                return ""
-
-            def _ts_body_summary(n):
-                body = None
-                for c in n.children:
-                    if c.type == "field_declaration_list":
-                        body = c
-                        break
-                if not body:
-                    return ""
-                access = "public"
-                methods = []
-                fields = []
-                for c in body.children:
-                    if c.type == "access_specifier":
-                        access = c.text.decode("utf8", errors="ignore").strip()
-                    elif c.type == "declaration":
-                        txt = c.text.decode("utf8", errors="ignore").strip()
-                        if txt.startswith("virtual") or "(" in txt:
-                            methods.append(f"{access}: {txt.split('(')[0].split()[-1]}(...)")
-                    elif c.type == "function_definition":
-                        decl = c.child_by_field_name("declarator")
-                        if decl:
-                            fid = decl.child_by_field_name("name")
-                            if not fid:
-                                for gc in decl.children:
-                                    if gc.type == "field_identifier":
-                                        fid = gc
-                                        break
-                            if fid:
-                                mname = fid.text.decode()
-                                param_list = decl.child_by_field_name("parameters")
-                                sig = param_list.text.decode("utf8", errors="ignore")[:40] if param_list else ""
-                                methods.append(f"{access}: {mname}{sig}")
-                    elif c.type == "field_declaration":
-                        txt = c.text.decode("utf8", errors="ignore").strip()
-                        # Check if it's a method declaration (has parentheses)
-                        if "(" in txt and txt.split("(")[0].strip().split()[-1]:
-                            mname = txt.split("(")[0].strip().split()[-1]
-                            sig = "(" + txt.split("(")[1][:40]
-                            methods.append(f"{access}: {mname}{sig}")
-                        else:
-                            # Member variable
-                            parts = txt.split()
-                            if parts and parts[-1] not in ("override", "= 0", "final"):
-                                fname = parts[-1].rstrip(";=,")
-                                if fname and not fname.startswith("//"):
-                                    fields.append(fname)
-                result = []
-                if methods:
-                    result.append("Methods: " + ", ".join(methods[:8]))
-                if fields:
-                    result.append("Fields: " + ", ".join(fields[:6]))
-                return ". ".join(result) if result else ""
-
-            def _ts_nl_description(name, node, bases_str):
-                if node.type not in ("class_specifier", "struct_specifier"):
-                    return ""
-                body = None
-                for c in node.children:
-                    if c.type == "field_declaration_list":
-                        body = c
-                        break
-                if not body:
-                    return ""
-
-                # Extract meaningful subwords from class name for enrichment
-                # Split class name into subwords (handle CamelCase and snake_case)
-                import re
-                subwords = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', name)
-                # Also split by underscore if present
-                if '_' in name:
-                    subwords = [word for subword in subwords for word in subword.split('_')]
-                subwords = [sw.lower() for sw in subwords if sw]
-
-                # Build fluent description using subwords from class name
-                base_name = ""
-                if bases_str:
-                    base_name = bases_str.replace(": ", "").replace("public ", "").strip()
-                    # Take first base only
-                    base_name = base_name.split(",")[0].strip().split()[-1] if base_name.split() else ""
-
-                desc_parts = []
-                
-                # Add class name with its meaningful subwords for enrichment
-                if subwords:
-                    # Filter out very generic words that don't add much meaning
-                    meaningful_subwords = [sw for sw in subwords if sw not in {'base', 'abstract', 'interface', 'impl', 'default', 'simple', 'basic'}]
-                    if meaningful_subwords:
-                        desc_parts.append(f"{name} ({' '.join(meaningful_subwords)})")
-                    else:
-                        desc_parts.append(f"{name}")
-                else:
-                    desc_parts.append(f"{name}")
-
-                # Add inheritance info if available
-                if base_name:
-                    desc_parts.append(f"extending {base_name}")
-
-                desc = " ".join(desc_parts) + "."
-                return f"Description: {desc}"
-
-            def _ts_template_params(n):
-                for c in n.children:
-                    if c.type == "template_parameter_list":
-                        return c.text.decode("utf8", errors="ignore")
-                return ""
-
             def _ts_decl_name(n):
                 for c in n.children:
                     if c.type == "identifier":
-                        return c.text.decode("utf8", errors="ignore")
+                        return node_text(c)
                     if c.type in ("reference_declarator", "pointer_declarator", "declarator", "function_declarator"):
                         result = _ts_decl_name(c)
                         if result:
@@ -573,7 +414,7 @@ class ASTParser:
             def walk(node, class_name=""):
                 if node.type in cls._CPP_SIGNIFICANT:
                     name_node = node.child_by_field_name("name")
-                    name = name_node.text.decode("utf8", errors="ignore") if name_node else ""
+                    name = node_text(name_node) if name_node else ""
                     if not name:
                         if node.type == "declaration":
                             name = _ts_decl_name(node)
@@ -582,7 +423,7 @@ class ASTParser:
                     doc = ""
                     for c in node.children:
                         if c.type == "comment":
-                            doc = c.text.decode("utf8", errors="ignore")
+                            doc = node_text(c)
                             break
                     if name:
                         params = node.child_by_field_name("parameters")
@@ -590,12 +431,11 @@ class ASTParser:
                             decl = node.child_by_field_name("declarator")
                             if decl:
                                 params = decl.child_by_field_name("parameters")
-                        sig_text = params.text.decode("utf8", errors="ignore") if params else ""
+                        sig_text = node_text(params) if params else ""
 
-                        label = _LABELS["mapping"].get(node.type, node.type)
-                        body_summary = _ts_body_summary(node)
-                        bases_text = _ts_base_classes(node) if node.type in ("class_specifier", "struct_specifier") else ""
-                        bases_list = [b.strip() for b in bases_text.replace(": ", "").split(",") if b.strip()] if bases_text else []
+                        label = label_for(node.type)
+                        body_summary = ts_body_summary(node)
+                        bases_list = ts_base_classes(node)[0] if node.type in ("class_specifier", "struct_specifier") else []
                         chunks.append({
                             "kind": label,
                             "name": name,
@@ -610,7 +450,7 @@ class ASTParser:
                 if node.type in ("class_specifier", "struct_specifier"):
                     nname = node.child_by_field_name("name")
                     if nname:
-                        next_class = nname.text.decode("utf8", errors="ignore")
+                        next_class = node_text(nname)
                 for c in node.children:
                     walk(c, next_class)
             walk(root)
@@ -624,13 +464,7 @@ class ASTParser:
             return cls._parse_fallback(source, path_hint, "Block")
         try:
             import clang.cindex as ci
-            # Try to set the library path to common locations
-            for libpath in ['/usr/lib/llvm-18/lib', '/usr/lib/llvm-15/lib', '/usr/lib/x86_64-linux-gnu']:
-                try:
-                    ci.Config.set_library_path(libpath)
-                    break
-                except:
-                    pass
+            _configure_clang(ci)
             index = ci.Index.create()
             # Parse the source as an unsaved file
             unsaved_file = (path_hint, source)
@@ -717,7 +551,6 @@ class ASTParser:
     # --- Tree-sitter based handler (JS / Go / Rust) ---
 
     @classmethod
-    @classmethod
     def _parse_treesitter(cls, source: str, path_hint: str = "") -> list[dict | str]:
         if not _TS_AVAILABLE:
             return []
@@ -739,16 +572,16 @@ class ASTParser:
             def walk(node):
                 if node.type in significant:
                     name_node = node.child_by_field_name("name")
-                    name = name_node.text.decode("utf8", errors="ignore") if name_node else ""
+                    name = node_text(name_node) if name_node else ""
                     doc = ""
                     for c in node.children:
                         if c.type == "comment":
-                            doc = c.text.decode("utf8", errors="ignore")
+                            doc = node_text(c)
                             break
                     if name:
                         params = node.child_by_field_name("parameters")
-                        sig_text = params.text.decode("utf8", errors="ignore") if params else ""
-                        label = _LABELS["mapping"].get(node.type, f"[{node.type}]")
+                        sig_text = node_text(params) if params else ""
+                        label = label_for(node.type, f"[{node.type}]")
                         chunks.append({
                             "kind": label,
                             "name": name,
@@ -825,6 +658,22 @@ class EmbeddingModel:
 
     def embed_many(self, texts: list[str]) -> np.ndarray:
         return self.model.encode(texts, normalize_embeddings=True)
+
+    def as_passages(self, texts: list[str]) -> list[str]:
+        """Apply the model's passage instruction prefix to indexable texts."""
+        return [self.passage_prefix + t for t in texts] if self.passage_prefix else texts
+
+    def embed_passage(self, text: str) -> np.ndarray:
+        return self.embed(self.passage_prefix + text if self.passage_prefix else text)
+
+    def embed_query(self, query: str) -> np.ndarray:
+        return self.embed(self.query_prefix + query if self.query_prefix else query)
+
+    @classmethod
+    def from_config(cls, cfg: "ModelConfig", device: Optional[str] = None) -> "EmbeddingModel":
+        return cls(cfg.model_name, device=cfg.device if device is None else device,
+                   query_prefix=cfg.query_prefix, passage_prefix=cfg.passage_prefix,
+                   float_type=cfg.float_type)
 
 
 class VectorStore:
@@ -920,67 +769,25 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
                   If not given, computed from config embedding_store + project name.
         delta: If True, build delta index (only changed files).
     """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    embedder_cfg_path = os.path.join(script_dir, "config.json")
-
-    # Compute data_dir from embedder config if not explicitly given
-    if data_dir is None:
-        if os.path.exists(embedder_cfg_path):
-            with open(embedder_cfg_path) as f:
-                ecfg = json.load(f)
-            store_root = ecfg.get("embedding_store")
-            if store_root:
-                store_root = os.path.expandvars(os.path.expanduser(store_root))
-                data_dir = os.path.join(store_root, os.path.basename(root))
-    if not data_dir:
-        data_dir = "data"
-
-    # Load model configuration — project root overrides, else fall back to embedder config
-    model_name = "all-MiniLM-L6-v2"
-    device = None
-    query_prefix = None
-    passage_prefix = None
-    batch_size = 1024
-    float_type = "fp32"
-    cfg_path = os.path.join(root, "config.json")
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        model_name = cfg.get("model_name", model_name)
-        device = cfg.get("device")
-        query_prefix = cfg.get("query_prefix")
-        passage_prefix = cfg.get("passage_prefix")
-        batch_size = cfg.get("batch_size", batch_size)
-        float_type = cfg.get("float_type", float_type)
-    elif os.path.exists(embedder_cfg_path):
-        with open(embedder_cfg_path) as f:
-            ecfg = json.load(f)
-        model_name = ecfg.get("model_name", model_name)
-        device = ecfg.get("device")
-        query_prefix = ecfg.get("query_prefix")
-        passage_prefix = ecfg.get("passage_prefix")
-        batch_size = ecfg.get("batch_size", batch_size)
-        float_type = ecfg.get("float_type", float_type)
-
-    # Initialize model
-    enc = EmbeddingModel(model_name, device=device,
-                         query_prefix=query_prefix, passage_prefix=passage_prefix,
-                         float_type=float_type)
+    data_dir = resolve_data_dir(root, data_dir)
+    cfg = ModelConfig.load(root)
+    enc = EmbeddingModel.from_config(cfg)
 
     project = root
     if delta:
         # --- Delta mode: only changed files ---
-        os.chdir(project)
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            capture_output=True, text=True, timeout=30
-        )
-        changed = [f.strip() for f in result.stdout.split('\n') if f.strip()]
+        changed = changed_files(project)
+        delta_vec_path = os.path.join(project, data_dir, 'delta.npz')
+        delta_texts_path = os.path.join(project, data_dir, 'delta_texts.json')
+
+        def _save_empty_delta(files: list[str]) -> None:
+            StorageIO.save(delta_vec_path, [], [], enc.dim)
+            with open(delta_texts_path, 'w') as f:
+                json.dump({"files": files, "texts": [], "model": cfg.model_name}, f)
+
         if not changed:
             print("Delta: no changed files")
-            StorageIO.save(os.path.join(project, data_dir, 'delta.npz'), [], [], enc.dim)
-            with open(os.path.join(project, data_dir, 'delta_texts.json'), 'w') as f:
-                json.dump({"files": [], "texts": [], "model": model_name}, f)
+            _save_empty_delta([])
             return
 
         print(f"Delta: {len(changed)} changed files")
@@ -991,81 +798,34 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
             if not os.path.isfile(abspath):
                 continue
             try:
-                file_chunks = ASTParser.parse_file(abspath, path_hint=fp)
-                if file_chunks:
-                    for c in file_chunks:
-                        if isinstance(c, str):
-                            if c.startswith(tuple(ASTParser.SKIP_PREFIXES)):
-                                continue
-                            chunks.append(c)
-                        else:
-                            enriched = strategy.enrich(c)
-                            kind = c.get("kind", "")
-                            name = c.get("name", "")
-                            f = c.get("file", "")
-                            prefix = f"{kind} {f} {name}".strip()
-                            if prefix:
-                                enriched = f"{prefix} | {enriched}" if enriched else prefix
-                            chunks.append(enriched)
+                chunks.extend(enrich_chunks(ASTParser.parse_file(abspath, path_hint=fp), strategy))
             except Exception as e:
                 chunks.append(f"[file] {fp} (read error: {e})")
 
         if not chunks:
             print("Delta: no parseable chunks")
-            StorageIO.save(os.path.join(project, data_dir, 'delta.npz'), [], [], enc.dim)
-            with open(os.path.join(project, data_dir, 'delta_texts.json'), 'w') as f:
-                json.dump({"files": changed, "texts": [], "model": model_name}, f)
+            _save_empty_delta(changed)
             return
 
-        embed_texts = [enc.passage_prefix + c for c in chunks] if enc.passage_prefix else chunks
-        vecs = enc.embed_many(embed_texts)
+        vecs = enc.embed_many(enc.as_passages(chunks))
 
-        out_vec = os.path.join(project, data_dir, 'delta.npz')
-        os.makedirs(os.path.dirname(out_vec), exist_ok=True)
-        StorageIO.save(out_vec, vecs, chunks, enc.dim)
+        os.makedirs(os.path.dirname(delta_vec_path), exist_ok=True)
+        StorageIO.save(delta_vec_path, vecs, chunks, enc.dim)
 
-        delta_data = {
-            "files": changed,
-            "texts": chunks,
-            "model": model_name,
-        }
-        with open(os.path.join(project, data_dir, 'delta_texts.json'), 'w') as f:
-            json.dump(delta_data, f, ensure_ascii=False)
+        with open(delta_texts_path, 'w') as f:
+            json.dump({"files": changed, "texts": chunks, "model": cfg.model_name}, f,
+                      ensure_ascii=False)
 
-        print(f"Delta index: {len(chunks)} chunks from {len(changed)} files -> {out_vec}")
+        print(f"Delta index: {len(chunks)} chunks from {len(changed)} files -> {delta_vec_path}")
     else:
         # --- Full rebuild ---
         chunks = ASTParser.scan_project(project)
 
-        # Enrich chunks with tree context and build node_ids mapping
         node_ids = [None] * len(chunks)
-        tree_index_path = os.path.join(data_dir, "tree_index.json")
-        if os.path.exists(tree_index_path):
-            try:
-                from tree_search import TreeIndex
-                ti = TreeIndex(data_dir=data_dir)
-                for i, text in enumerate(chunks):
-                    n = ti.match_node(text)
-                    if n is None:
-                        continue
-                    uid = n["_uid"]
-                    node_ids[i] = uid
-                    # Append parent context to chunk text
-                    parent = ti.get_parent(uid)
-                    if parent:
-                        chunks[i] += f". Parent: {parent['name']}"
-                    # Append children context
-                    kids = ti.get_children(uid)
-                    if kids:
-                        child_names = [c["name"] for c in kids[:6]]
-                        chunks[i] += f". Children: {', '.join(child_names)}"
-                matched = sum(1 for n in node_ids if n is not None)
-                print(f"  enriched {matched}/{len(chunks)} chunks with tree context")
-            except Exception as e:
-                print(f"  tree enrichment skipped: {e}")
+        if os.path.exists(os.path.join(data_dir, "tree_index.json")):
+            node_ids = add_tree_context(chunks, data_dir)
 
-        embed_texts = [enc.passage_prefix + c for c in chunks] if enc.passage_prefix else chunks
-        vecs = enc.embed_many(embed_texts)
+        vecs = enc.embed_many(enc.as_passages(chunks))
 
         out = os.path.join(project, data_dir, 'enriched_vectors.npz')
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -1086,22 +846,7 @@ def _parse_file_worker(args):
 
     # Flat chunks (all supported files)
     try:
-        file_chunks = ASTParser.parse_file(fp, path_hint=rel)
-        if file_chunks:
-            for c in file_chunks:
-                if isinstance(c, str):
-                    if c.startswith(tuple(ASTParser.SKIP_PREFIXES)):
-                        continue
-                    flat_chunks.append(c)
-                else:
-                    enriched = strategy.enrich(c)
-                    kind = c.get("kind", "")
-                    name = c.get("name", "")
-                    f = c.get("file", "")
-                    prefix = f"{kind} {f} {name}".strip()
-                    if prefix:
-                        enriched = f"{prefix} | {enriched}" if enriched else prefix
-                    flat_chunks.append(enriched)
+        flat_chunks = enrich_chunks(ASTParser.parse_file(fp, path_hint=rel), strategy)
     except Exception:
         pass
 
@@ -1118,7 +863,7 @@ def _parse_file_worker(args):
 
 
 def _parse_files(root: str, num_workers: int | None = None,
-                 exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}) -> tuple:
+                 exclude=DEFAULT_EXCLUDE) -> tuple:
     """Phase 1: parse source files (CPU only, no GPU model)."""
     from tree_ast_parser import LANGUAGES as TREE_LANGS
     tree_exts = tuple(TREE_LANGS.keys())
@@ -1176,59 +921,20 @@ def _parse_files(root: str, num_workers: int | None = None,
 
 def build_all(root: str, data_dir: str | None = None, num_workers: int | None = None,
               embed_mode: str = "multi",
-              exclude={"/venv/", "/__pycache__/", "/.", "/node_modules/", "/.git/"}) -> None:
+              exclude=DEFAULT_EXCLUDE) -> None:
     """Build both tree and flat indices.
 
     Phase 1: parse source files (CPU only, no GPU).
     Phase 2: load model, embed, save indices.
     """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    embedder_cfg_path = os.path.join(script_dir, "config.json")
-
-    # Resolve data_dir
-    if data_dir is None:
-        if os.path.exists(embedder_cfg_path):
-            with open(embedder_cfg_path) as f:
-                ecfg = json.load(f)
-            store_root = ecfg.get("embedding_store")
-            if store_root:
-                store_root = os.path.expandvars(os.path.expanduser(store_root))
-                data_dir = os.path.join(store_root, os.path.basename(root))
-    if not data_dir:
-        data_dir = "data"
-
-    # Load model config
-    model_name = "all-MiniLM-L6-v2"
-    device = None
-    query_prefix = None
-    passage_prefix = None
-    batch_size = 1024
-    float_type = "fp32"
-    cfg_path = os.path.join(root, "config.json")
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        model_name = cfg.get("model_name", model_name)
-        device = cfg.get("device")
-        query_prefix = cfg.get("query_prefix")
-        passage_prefix = cfg.get("passage_prefix")
-        batch_size = cfg.get("batch_size", batch_size)
-        float_type = cfg.get("float_type", float_type)
-    elif os.path.exists(embedder_cfg_path):
-        with open(embedder_cfg_path) as f:
-            ecfg = json.load(f)
-        model_name = ecfg.get("model_name", model_name)
-        device = ecfg.get("device")
-        query_prefix = ecfg.get("query_prefix")
-        passage_prefix = ecfg.get("passage_prefix")
-        batch_size = ecfg.get("batch_size", batch_size)
-        float_type = ecfg.get("float_type", float_type)
+    data_dir = resolve_data_dir(root, data_dir)
+    cfg = ModelConfig.load(root)
 
     # Infer mode from device
     if embed_mode is None:
-        if device and device.startswith("cuda"):
+        if cfg.device and cfg.device.startswith("cuda"):
             embed_mode = "gpu"
-        elif device == "cpu":
+        elif cfg.device == "cpu":
             embed_mode = "cpu"
         else:
             import torch
@@ -1237,7 +943,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     os.makedirs(data_dir, exist_ok=True)
     tree_json_path = os.path.join(data_dir, "tree_index.json")
     tree_exists = os.path.exists(tree_json_path)
-    BATCH = batch_size
+    BATCH = cfg.batch_size
 
     # Phase 1: parse files (no GPU) — always needed for flat chunks
     all_tree_nodes, tree_texts, chunks = _parse_files(root, num_workers, exclude)
@@ -1247,13 +953,9 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
     enc_gpu = None
     enc_cpu = None
     if embed_mode in ("multi", "gpu"):
-        enc_gpu = EmbeddingModel(model_name, device=device or "cuda",
-                                 query_prefix=query_prefix, passage_prefix=passage_prefix,
-                                 float_type=float_type)
+        enc_gpu = EmbeddingModel.from_config(cfg, device=cfg.device or "cuda")
     if embed_mode in ("multi", "cpu"):
-        enc_cpu = EmbeddingModel(model_name, device="cpu",
-                                 query_prefix=query_prefix, passage_prefix=passage_prefix,
-                                 float_type=float_type)
+        enc_cpu = EmbeddingModel.from_config(cfg, device="cpu")
 
     if tree_exists and os.path.exists(os.path.join(data_dir, "tree_vectors.npz")):
         print("Tree index exists, skipping tree embedding", flush=True)
@@ -1262,8 +964,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         # Batch-embed tree texts (pre-allocated to avoid list-of-arrays)
         tree_vecs = np.array([])
         if tree_texts and enc_tree is not None:
-            prefix = enc_tree.passage_prefix
-            embed_texts = [prefix + t for t in tree_texts] if prefix else tree_texts
+            embed_texts = enc_tree.as_passages(tree_texts)
             dim = enc_tree.dim
             n = len(embed_texts)
             tree_vecs = np.empty((n, dim), dtype=np.float32)
@@ -1283,28 +984,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
             print("No tree nodes found")
 
     # Enrich flat chunks with tree context and build node_ids
-    node_ids = [None] * len(chunks)
-    try:
-        from tree_search import TreeIndex
-        ti = TreeIndex(data_dir=data_dir)
-        for i, text in enumerate(chunks):
-            n = ti.match_node(text)
-            if n is None:
-                continue
-            uid = n["_uid"]
-            node_ids[i] = uid
-            parent = ti.get_parent(uid)
-            if parent:
-                chunks[i] += f". Parent: {parent['name']}"
-            kids = ti.get_children(uid)
-            if kids:
-                child_names = [c["name"] for c in kids[:6]]
-                chunks[i] += f". Children: {', '.join(child_names)}"
-            if (i + 1) % max(1, len(chunks) // 40) == 0 or i == len(chunks) - 1:
-                matched = sum(1 for n in node_ids[:i+1] if n is not None)
-                print(f"  enrich [{i+1}/{len(chunks)}] {matched} matched", flush=True)
-    except Exception as e:
-        print(f"  tree enrichment skipped: {e}")
+    node_ids = add_tree_context(chunks, data_dir, progress_steps=40)
 
     # Flat chunk embedding
     print(f"  embedding {len(chunks)} flat chunks (mode={embed_mode})...", flush=True)
@@ -1319,8 +999,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
             print(f"    [{min(i+BATCH, n)}/{n}]", flush=True)
         return out
 
-    prefix = (enc_gpu or enc_cpu).passage_prefix
-    embed_chunks = [prefix + c for c in chunks] if prefix else chunks
+    embed_chunks = (enc_gpu or enc_cpu).as_passages(chunks)
 
     if embed_mode == "multi":
         from concurrent.futures import ThreadPoolExecutor

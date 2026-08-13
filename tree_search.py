@@ -45,7 +45,8 @@ class TreeIndex:
 
     def annotate(self, hits: list[dict]) -> list[dict]:
         for h in hits:
-            n = self.match_node(h.get("text", ""))
+            nid = h.get("node_id")
+            n = self.get_node(nid) if nid is not None else self.match_node(h.get("text", ""))
             if not n:
                 continue
             uid = n["_uid"]
@@ -106,9 +107,6 @@ class TreeIndex:
             self.children[parent_uid].append(nid)
 
         return uid, max_original_id_without_shift
-
-    def get_node(self, node_id: int) -> dict | None:
-        return self.nodes.get(node_id)
 
     def get_children(self, node_id: int) -> list[dict]:
         return [self.nodes[cid] for cid in self.children.get(node_id, []) if cid in self.nodes]
