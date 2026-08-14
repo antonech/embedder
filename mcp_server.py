@@ -2,7 +2,9 @@ import os
 import json
 import asyncio
 import argparse
+import logging
 import re
+import sys
 import numpy as np
 from mcp.server.fastmcp import FastMCP
 from common import ModelConfig, project_data_dir, resolve_device
@@ -13,6 +15,13 @@ from tree_search import TreeIndex
 RERANK_CANDIDATES = 4
 # Cross-encoder forward-pass batch size.
 RERANK_BATCH = 32
+
+# stdout carries the JSON-RPC stream, so all diagnostics must go to stderr.
+logging.basicConfig(
+    level=os.environ.get("EMBEDDER_LOG_LEVEL", "INFO").upper(), stream=sys.stderr,
+    format="%(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
 class EmbedderApp:
@@ -31,8 +40,10 @@ class EmbedderApp:
         self.encoder = EmbeddingModel(model_name, device=device, float_type=float_type)
         self.store = VectorStore()
         self._bm25 = None
+        self._delta_count = 0
         self.cross_encoder = None
         self.cross_encoder_tokenizer = None
+        self.cross_encoder_error: str | None = None
         if cross_encoder_model:
             try:
                 from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -42,7 +53,8 @@ class EmbedderApp:
                     cross_encoder_model
                 ).to(ce_dev)
             except Exception as e:
-                print(f"Warning: failed to load cross-encoder '{cross_encoder_model}': {e}")
+                self.cross_encoder_error = f"failed to load cross-encoder '{cross_encoder_model}': {e}"
+                log.warning("%s; continuing without reranking", self.cross_encoder_error)
 
     def _tokenize(self, text: str) -> list[str]:
         words = re.split(r'[^a-zA-Z0-9]+', text)
@@ -79,19 +91,25 @@ class EmbedderApp:
 
     def load_delta(self, data_path: str) -> str:
         if not os.path.exists(data_path):
-            return "No delta file"
+            raise FileNotFoundError(f"delta file not found: {data_path}")
         vecs, texts, dim, _ = StorageIO.load(data_path)
         self.store.vectors.extend(vecs)
         self.store.texts.extend(texts)
+        self.store.node_ids.extend([None] * len(texts))
+        self.store.invalidate_cache()
         self._delta_count = len(vecs)
+        self._build_bm25()
         return f"Loaded {len(vecs)} delta vectors"
 
     def clear_delta(self) -> str:
-        if self._delta_count < 1 or not hasattr(self, '_delta_count'):
+        if self._delta_count < 1:
             return "No delta to clear"
         self.store.vectors = self.store.vectors[:-self._delta_count]
         self.store.texts = self.store.texts[:-self._delta_count]
+        self.store.node_ids = self.store.node_ids[:-self._delta_count]
+        self.store.invalidate_cache()
         self._delta_count = 0
+        self._build_bm25()
         return "Delta cleared"
 
     def _get_tree(self):
@@ -130,6 +148,8 @@ class EmbedderApp:
 
         # Normalize tree scores
         tree_scores = [h["score"] for h in tree_hits]
+        if not tree_scores:
+            return flat_hits
         t_min, t_max = min(tree_scores), max(tree_scores)
 
         # Build flat result lookup by flat idx
@@ -269,6 +289,8 @@ class EmbedderApp:
         """Top BM25 documents with scores min-max normalized over the returned window."""
         top_idxs = bm25_top[:top_k]
         top_scores = [bm25_raw[i] for i in top_idxs]
+        if not top_scores:
+            return []
         min_b, max_b = min(top_scores), max(top_scores)
         return [
             {"text": self.store.texts[i],
@@ -307,6 +329,8 @@ class EmbedderApp:
         emb_ranks = {h["idx"]: r for r, h in enumerate(emb_hits)}
         bm25_ranks = {idx: r for r, idx in enumerate(bm25_top)}
         cand_bm25 = {idx: bm25_raw[idx] for idx in candidates}
+        if not cand_bm25:
+            return []
         min_b, max_b = min(cand_bm25.values()), max(cand_bm25.values())
 
         K = 5
@@ -343,11 +367,13 @@ class EmbedderApp:
 
     def add_document(self, text: str) -> str:
         self.store.add(self.encoder.embed_passage(text), text)
+        self._build_bm25()
         return f"Added, total vectors: {len(self.store)}"
 
     def add_documents(self, texts: list[str]) -> str:
         vecs = self.encoder.embed_many(self.encoder.as_passages(texts))
         self.store.add_many(vecs, texts)
+        self._build_bm25()
         return f"Added {len(texts)} docs, total vectors: {len(self.store)}"
 
     def save(self, path: str) -> str:
@@ -358,8 +384,11 @@ class EmbedderApp:
     def info(self) -> str:
         n = len(self.store)
         sample = self.store.texts[:3] if n > 0 else []
-        delta = getattr(self, '_delta_count', 0)
-        return json.dumps({"vectors": n, "delta": delta, "sample_texts": sample}, ensure_ascii=False)
+        delta = self._delta_count
+        info = {"vectors": n, "delta": delta, "sample_texts": sample}
+        if self.cross_encoder_error:
+            info["cross_encoder_error"] = self.cross_encoder_error
+        return json.dumps(info, ensure_ascii=False)
 
 
 projects: dict[str, EmbedderApp] = {}
@@ -489,6 +518,8 @@ async def main():
     data_path = os.path.join(data_dir, "enriched_vectors.npz")
     if os.path.exists(data_path):
         app.init(data_path)
+    else:
+        log.warning("no flat index at %s, serving an empty store", data_path)
 
     delta_path = os.path.join(data_dir, "delta.npz")
     if os.path.exists(delta_path):

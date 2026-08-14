@@ -1,4 +1,4 @@
-import os, json, ast, re as _re, argparse, sys
+import os, json, ast, re as _re, argparse, logging, sys
 
 import numpy as np
 from typing import Optional
@@ -11,6 +11,8 @@ from common import (
     add_tree_context, changed_files, enrich_chunks, label_for, load_json,
     node_text, resolve_data_dir, ts_base_classes, ts_body_summary,
 )
+
+log = logging.getLogger(__name__)
 
 try:
     from tree_sitter import Language, Parser
@@ -40,15 +42,16 @@ def _configure_clang(ci_module) -> None:
         try:
             ci_module.Config.set_library_path(libpath)
             break
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug("clang library path %s rejected: %s", libpath, e)
 
 
 try:
     import clang.cindex as ci
     _configure_clang(ci)
     _CLANG_AVAILABLE = True
-except Exception:
+except Exception as e:
+    log.debug("clang bindings unavailable, C++ parsing falls back to tree-sitter: %s", e)
     _CLANG_AVAILABLE = False
 
 _TS_SIGNIFICANT = {
@@ -246,7 +249,8 @@ class ASTParser:
         try:
             with open(filepath, errors='replace') as f:
                 content = f.read()
-        except Exception:
+        except OSError as e:
+            log.warning("cannot read %s: %s", filepath, e)
             return []
         if not content.strip() or '\x00' in content[:2000]:
             return []
@@ -280,7 +284,7 @@ class ASTParser:
                 try:
                     chunks.extend(enrich_chunks(cls.parse_file(fp, path_hint=name), strategy))
                 except Exception:
-                    pass
+                    log.warning("failed to parse %s, skipping", fp, exc_info=True)
         return chunks
 
     # --- Python handler ---
@@ -317,7 +321,8 @@ class ASTParser:
                     args = [a.arg for a in node.args.args]
                     try:
                         body_lines = [ast.unparse(s)[:80] for s in node.body[:2]]
-                    except Exception:
+                    except Exception as e:
+                        log.debug("cannot unparse body of %s in %s: %s", node.name, path_hint, e)
                         body_lines = []
                     chunks.append({
                         "kind": "Function",
@@ -386,7 +391,11 @@ class ASTParser:
             from tree_sitter import Language, Parser
             import tree_sitter_cpp
             lang = Language(tree_sitter_cpp.language())
-        except Exception:
+        except Exception as e:
+            log.warning(
+                "tree-sitter C++ grammar unavailable (%s), using line-based chunking for %s",
+                e, path_hint,
+            )
             return cls._parse_fallback(source, path_hint, "Block")
 
         chunks: list[str] = []
@@ -472,8 +481,10 @@ class ASTParser:
             if tu.diagnostics:
                 for diag in tu.diagnostics:
                     if diag.severity >= ci.Diagnostic.Error:
+                        log.debug("clang reported errors for %s, using line-based chunking", path_hint)
                         return cls._parse_fallback(source, path_hint, "Block")
-        except Exception:
+        except Exception as e:
+            log.warning("clang parse of %s failed (%s), using line-based chunking", path_hint, e)
             return cls._parse_fallback(source, path_hint, "Block")
 
         chunks: list[str] = []
@@ -501,7 +512,8 @@ class ASTParser:
                             for arg_type in func_type.argument_types():
                                 arg_types.append(arg_type.spelling)
                             signature = f"({', '.join(arg_types)})"
-                        except Exception:
+                        except Exception as e:
+                            log.debug("cannot build signature in %s: %s", path_hint, e)
                             signature = ""
                     # Get base classes for class/struct
                     extra = []
@@ -511,8 +523,8 @@ class ASTParser:
                             if c.kind == ci.CursorKind.CXX_BASE_SPECIFIER:
                                 try:
                                     bases.append(c.type.spelling)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    log.debug("cannot read base class in %s: %s", path_hint, e)
                         if bases:
                             extra.append(": public " + ", public ".join(bases))
 
@@ -630,8 +642,11 @@ class EmbeddingModel:
         try:
             arch_max = self.model._first_module().auto_model.config.max_position_embeddings
             target = min(target, arch_max)
-        except Exception:
-            pass
+        except Exception as e:
+            log.debug(
+                "cannot read max_position_embeddings for %s, using %d: %s",
+                model_name, target, e,
+            )
 
         self.model.max_seq_length = target
         self.model.tokenizer.model_max_length = target
@@ -697,6 +712,11 @@ class VectorStore:
         self.texts.append(text)
         self.node_ids.append(node_id)
         self._array_cache = None
+
+    def invalidate_cache(self) -> None:
+        """Drop the stacked-vector cache after `vectors` is mutated directly."""
+        self._array_cache = None
+        self._cached_len = 0
 
     def add_many(self, vecs: np.ndarray, texts: list[str], node_ids: list[int | None] | None = None) -> None:
         self.vectors.extend(vecs)
@@ -834,11 +854,16 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
 
 
 def _parse_file_worker(args):
-    """Worker function for parallel file parsing (CPU only, no GPU)."""
+    """Worker function for parallel file parsing (CPU only, no GPU).
+
+    Returns (tree_nodes, flat_chunks, rel, errors); errors describe per-file
+    failures so the parent process can report them instead of losing them.
+    """
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     fp, rel, root, tree_exts, exclude = args
+    errors: list[str] = []
     if any(x in fp for x in exclude):
-        return [], [], rel
+        return [], [], rel, errors
 
     tree_nodes = []
     flat_chunks = []
@@ -847,8 +872,8 @@ def _parse_file_worker(args):
     # Flat chunks (all supported files)
     try:
         flat_chunks = enrich_chunks(ASTParser.parse_file(fp, path_hint=rel), strategy)
-    except Exception:
-        pass
+    except Exception as e:
+        errors.append(f"flat parse of {rel} failed: {e!r}")
 
     # Tree nodes (code languages only)
     if fp.endswith(tree_exts):
@@ -856,10 +881,10 @@ def _parse_file_worker(args):
             from tree_ast_parser import parse_file as tree_parse_file
             nodes = tree_parse_file(fp, root=root)
             tree_nodes = nodes
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append(f"tree parse of {rel} failed: {e!r}")
 
-    return tree_nodes, flat_chunks, rel
+    return tree_nodes, flat_chunks, rel, errors
 
 
 def _parse_files(root: str, num_workers: int | None = None,
@@ -886,13 +911,20 @@ def _parse_files(root: str, num_workers: int | None = None,
     all_tree_nodes = []
     chunks = []
     tree_node_count = 0
+    failed_files = 0
+    parse_errors = 0
     with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as pool:
         futures = {pool.submit(_parse_file_worker, f): f[0] for f in file_list}
         for i, f in enumerate(as_completed(futures)):
             try:
-                tree_nodes, flat_chunks, _ = f.result()
-            except Exception as e:
+                tree_nodes, flat_chunks, _, errors = f.result()
+            except Exception:
+                failed_files += 1
+                log.warning("worker crashed on %s", futures[f], exc_info=True)
                 continue
+            for err in errors:
+                parse_errors += 1
+                log.warning("%s", err)
             if tree_nodes:
                 all_tree_nodes.append(tree_nodes)
                 tree_node_count += len(tree_nodes)
@@ -915,6 +947,12 @@ def _parse_files(root: str, num_workers: int | None = None,
             n["parent_id"] = old_to_new.get(pid, -1)
         tree_texts.extend(n["text"] for n in file_nodes)
     all_tree_nodes = [n for nodes in all_tree_nodes for n in nodes]
+    if failed_files or parse_errors:
+        print(f"  WARNING: {failed_files} files crashed a worker, {parse_errors} parse errors", flush=True)
+    if file_list and failed_files == len(file_list):
+        raise RuntimeError(
+            f"all {len(file_list)} files failed to parse; see log for details"
+        )
     print(f"  parsed {len(all_tree_nodes)} tree nodes, {len(chunks)} flat chunks", flush=True)
     return all_tree_nodes, tree_texts, chunks
 
@@ -1030,15 +1068,19 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
                 chunk_queue.task_done()
 
         pool = ThreadPoolExecutor(max_workers=2)
+        worker_futures = []
         if enc_gpu is not None:
-            pool.submit(_embed_worker, enc_gpu, "GPU")
+            worker_futures.append(pool.submit(_embed_worker, enc_gpu, "GPU"))
         if enc_cpu is not None:
-            pool.submit(_embed_worker, enc_cpu, "CPU")
+            worker_futures.append(pool.submit(_embed_worker, enc_cpu, "CPU"))
         try:
             pool.shutdown()
         except KeyboardInterrupt:
             print("\nInterrupted, exiting...", flush=True)
-            os._exit(0)
+            os._exit(130)
+        # Surface worker exceptions instead of saving a partial index.
+        for fut in worker_futures:
+            fut.result()
         results.sort(key=lambda x: x[0])
         flat_dim = (enc_gpu or enc_cpu).dim
         vecs = np.empty((len(embed_chunks), flat_dim), dtype=np.float32)
@@ -1046,6 +1088,10 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         for _, batch_vecs in results:
             vecs[pos:pos + len(batch_vecs)] = batch_vecs
             pos += len(batch_vecs)
+        if pos != len(embed_chunks):
+            raise RuntimeError(
+                f"embedding incomplete: {pos}/{len(embed_chunks)} chunks embedded"
+            )
     elif embed_mode == "gpu":
         vecs = _embed_sequential(enc_gpu, embed_chunks)
     else:
@@ -1068,6 +1114,11 @@ if __name__ == "__main__":
     parser.add_argument('--embed-mode', choices=['multi', 'gpu', 'cpu'], default=None,
                         help='Embedding mode: multi (GPU+CPU, default), gpu-only, cpu-only')
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=os.environ.get("EMBEDDER_LOG_LEVEL", "WARNING").upper(), stream=sys.stderr,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
     if args.build_all:
         build_all(args.root, args.data_dir, num_workers=args.workers, embed_mode=args.embed_mode)
