@@ -86,6 +86,21 @@ def test_match_node(data_dir, text, expected):
     assert (node["name"] if node else None) == expected
 
 
+def test_match_node_disambiguates_method_from_module_function(tmp_path):
+    nodes = [
+        _node(0, "Service", type="class_definition", start=1, end=20),
+        _node(1, "run", parent_id=0, start=2, end=5),
+        _node(2, "run", start=30, end=35),
+    ]
+    _write(tmp_path / "tree_index.json", nodes)
+    idx = TreeIndex(data_dir=str(tmp_path))
+
+    method = idx.match_node("Method a.py run | (self) | In class: Service")
+    assert method["start_line"] == 2
+    module_fn = idx.match_node("Function a.py run | (project)")
+    assert module_fn["start_line"] == 30
+
+
 def test_annotate_adds_context(data_dir):
     idx = TreeIndex(data_dir=str(data_dir))
     hits = [

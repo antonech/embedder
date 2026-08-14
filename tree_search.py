@@ -8,6 +8,7 @@ class TreeIndex:
         self.texts = []
         self.id_map = {}
         self.lookup = {}
+        self.name_uids = {}
 
         tree_path = os.path.join(data_dir, "tree_index.json")
         delta_path = os.path.join(data_dir, "delta_tree_index.json")
@@ -28,6 +29,29 @@ class TreeIndex:
             name = node.get("name", "")
             if file and name:
                 self.lookup[(file, name)] = uid
+                self.name_uids.setdefault((file, name), []).append(uid)
+
+    def _owner_class(self, uid: int) -> str:
+        parent = self.get_parent(uid)
+        if parent and "class" in parent.get("type", ""):
+            return parent.get("name", "")
+        return ""
+
+    def _pick_uid(self, uids: list[int], text: str) -> int:
+        """Disambiguate same-named nodes in one file by enclosing class.
+
+        A method and a module-level function can share a name (a class method and
+        its thin module-level wrapper), so the chunk's `In class:` marker decides
+        which node the chunk belongs to.
+        """
+        if len(uids) == 1:
+            return uids[0]
+        m = re.search(r'In class:\s*([A-Za-z_]\w*)', text)
+        wanted = m.group(1) if m else ""
+        for uid in uids:
+            if self._owner_class(uid) == wanted:
+                return uid
+        return uids[0]
 
     def match_node(self, text: str) -> dict | None:
         m = re.match(r'^\S+\s+(\S+)\s+(\S+)', text)
@@ -35,10 +59,10 @@ class TreeIndex:
             return None
         file = m.group(1)
         name = m.group(2).rstrip(".,;:!?(){}[]")
-        uid = self.lookup.get((file, name))
-        if uid is not None:
-            return self.nodes.get(uid)
-        return None
+        uids = self.name_uids.get((file, name))
+        if not uids:
+            return None
+        return self.nodes.get(self._pick_uid(uids, text))
 
     def annotate(self, hits: list[dict]) -> list[dict]:
         for h in hits:
