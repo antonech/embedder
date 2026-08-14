@@ -210,6 +210,26 @@ def test_load_delta_missing_file(app, tmp_path):
         app.load_delta(str(tmp_path / "nope.npz"))
 
 
+def test_load_delta_rejects_dimension_mismatch(app, store_path, tmp_path):
+    app.init(str(store_path))
+    delta_texts = ["Function new.py added_fn | brand new"]
+    delta_path = tmp_path / "delta.npz"
+    StorageIO.save(str(delta_path), np.ones((1, 8), dtype=np.float32), delta_texts, 8)
+
+    with pytest.raises(ValueError, match="does not match the store"):
+        app.load_delta(str(delta_path))
+    assert app.store.texts == TEXTS
+    assert app.search("user", top_k=1)
+
+
+def test_init_rejects_npz_without_vectors(app, tmp_path):
+    bad_path = tmp_path / "bad.npz"
+    np.savez_compressed(str(bad_path), dim=np.array(8))
+
+    with pytest.raises(ValueError, match="not a valid index"):
+        app.init(str(bad_path))
+
+
 # --- formatting ---
 
 def test_format_text_and_json():

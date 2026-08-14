@@ -124,6 +124,13 @@ class EmbedderApp:
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"delta file not found: {data_path}")
         vecs, texts, dim, _ = StorageIO.load(data_path)
+        if len(self.store) > 0:
+            store_dim = int(self.store.vectors[0].shape[0])
+            if dim != store_dim:
+                raise ValueError(
+                    f"delta dimension {dim} does not match the store ({store_dim}); "
+                    f"rebuild the delta with the same model"
+                )
         self.store.vectors.extend(vecs)
         self.store.texts.extend(texts)
         self.store.node_ids.extend([None] * len(texts))
