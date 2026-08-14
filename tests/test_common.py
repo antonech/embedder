@@ -11,6 +11,32 @@ def test_load_json_missing_and_invalid(tmp_path):
     bad.write_text("{not json")
     with pytest.raises(RuntimeError):
         common.load_json(str(bad))
+    not_object = tmp_path / "list.json"
+    not_object.write_text("[1, 2]")
+    with pytest.raises(RuntimeError, match="expected a JSON object"):
+        common.load_json(str(not_object))
+
+
+def test_load_project_config_ignores_foreign_files(tmp_path, caplog):
+    assert common.load_project_config(str(tmp_path / "nope.json")) == {}
+
+    commented = tmp_path / "commented.json"
+    commented.write_text('{\n  // dev server\n  "port": 3000\n}\n')
+    with caplog.at_level("WARNING"):
+        assert common.load_project_config(str(commented)) == {}
+    assert "ignoring" in caplog.text
+
+    other_app = tmp_path / "other.json"
+    other_app.write_text(json.dumps({"port": 3000}))
+    assert common.load_project_config(str(other_app)) == {}
+
+    a_list = tmp_path / "list.json"
+    a_list.write_text("[]")
+    assert common.load_project_config(str(a_list)) == {}
+
+    ours = tmp_path / "ours.json"
+    ours.write_text(json.dumps({"model_name": "m", "port": 3000}))
+    assert common.load_project_config(str(ours)) == {"model_name": "m", "port": 3000}
 
 
 def test_load_labels_falls_back_to_defaults(monkeypatch, tmp_path):
@@ -54,6 +80,17 @@ def test_model_config_load_prefers_project_config(tmp_path, monkeypatch):
     fallback.write_text(json.dumps({"model_name": "own-model"}))
     monkeypatch.setattr(common, "CONFIG_PATH", str(fallback))
     assert common.ModelConfig.load(str(tmp_path / "elsewhere")).model_name == "own-model"
+
+
+def test_model_config_load_falls_back_when_project_config_is_foreign(tmp_path, monkeypatch):
+    fallback = tmp_path / "fallback.json"
+    fallback.write_text(json.dumps({"model_name": "own-model"}))
+    monkeypatch.setattr(common, "CONFIG_PATH", str(fallback))
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "config.json").write_text('{\n  // dev server\n  "port": 3000\n}\n')
+    assert common.ModelConfig.load(str(project)).model_name == "own-model"
 
 
 def _cpp_root(src: str):

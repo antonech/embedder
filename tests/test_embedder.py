@@ -268,6 +268,15 @@ def test_load_strategy_without_config(tmp_path):
     assert ASTParser._use_clang is False
 
 
+def test_scan_project_survives_a_foreign_config_json(tmp_path):
+    (tmp_path / "svc.py").write_text(PY_SOURCE)
+    (tmp_path / "config.json").write_text('{\n  // dev server\n  "port": 3000\n}\n')
+
+    chunks = ASTParser.scan_project(str(tmp_path))
+    assert ASTParser._use_clang is False
+    assert any("Class svc.py Service" in c for c in chunks)
+
+
 def test_scan_project_prefixes_chunks_and_skips_dirs(tmp_path):
     (tmp_path / "svc.py").write_text(PY_SOURCE)
     (tmp_path / "venv").mkdir()
