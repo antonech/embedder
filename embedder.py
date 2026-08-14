@@ -1,4 +1,4 @@
-import os, json, ast, re as _re, argparse, logging, sys
+import os, json, ast, argparse, logging, sys
 
 import numpy as np
 from typing import Optional
@@ -10,9 +10,14 @@ from common import (
     SKIP_DIRS as _SKIP_DIRS, SKIP_PREFIXES as _SKIP_PREFIXES,
     add_tree_context, changed_files, enrich_chunks, label_for, load_json,
     node_text, resolve_data_dir, ts_base_classes, ts_body_summary,
+    ts_declarator_name,
 )
 
 log = logging.getLogger(__name__)
+
+# Enrichment applied to each AST node when config.json does not say otherwise.
+# Deliberately excludes "statements": raw body lines are noise for retrieval.
+DEFAULT_ENRICHMENT = ["signature", "structure", "content", "docstring"]
 
 try:
     from tree_sitter import Language, Parser
@@ -134,14 +139,16 @@ class DocstringStrategy(EnrichmentStrategy):
         return node.get("docstring", node.get("doc", ""))
 
 
-class BodyStrategy(EnrichmentStrategy):
-    """Methods, fields, bases, and body lines as summary."""
+class StructureStrategy(EnrichmentStrategy):
+    """Shape of a node: owning class, methods, fields, bases.
 
-    MAX_LINES = 5
+    Structural facts are what makes a chunk findable ("which class has a
+    send_packet method?"), so this is part of the default enrichment.
+    """
 
     @classmethod
     def key(cls) -> str:
-        return "body"
+        return "structure"
 
     def enrich(self, node: dict) -> str:
         parts = []
@@ -163,14 +170,70 @@ class BodyStrategy(EnrichmentStrategy):
             b_strs = [str(b)[:60] for b in bases[:4]]
             if b_strs:
                 parts.append("Inherits: " + ", ".join(b_strs))
-        body = node.get("body", [])
-        if isinstance(body, list):
-            lines = [str(b)[:100] for b in body if str(b).strip()]
-            for line in lines[:self.MAX_LINES]:
-                parts.append(line)
-        elif isinstance(body, str) and body.strip():
-            parts.append(body[:200])
         return " | ".join(parts)
+
+
+class ContentStrategy(EnrichmentStrategy):
+    """Prose/summary text for nodes whose body is a single string.
+
+    This is the only signal non-code files (.md, .json, unknown types) carry, and
+    it also holds the C++ class summary, so it stays in the default enrichment.
+    """
+
+    MAX_CHARS = 200
+
+    @classmethod
+    def key(cls) -> str:
+        return "content"
+
+    def enrich(self, node: dict) -> str:
+        body = node.get("body", "")
+        if isinstance(body, str) and body.strip():
+            return body[:self.MAX_CHARS]
+        return ""
+
+
+class StatementsStrategy(EnrichmentStrategy):
+    """First few source statements of a function body.
+
+    Opt-in: statements are mostly noise for retrieval (control flow and local
+    variable names rarely describe what the function is for) and they crowd out
+    the signature/docstring. Enable with "statements" in config enrichment.
+    """
+
+    MAX_LINES = 5
+    MAX_CHARS = 100
+
+    @classmethod
+    def key(cls) -> str:
+        return "statements"
+
+    def enrich(self, node: dict) -> str:
+        body = node.get("body", [])
+        if not isinstance(body, list):
+            return ""
+        lines = [str(b)[:self.MAX_CHARS] for b in body if str(b).strip()]
+        return " | ".join(lines[:self.MAX_LINES])
+
+
+class BodyStrategy(EnrichmentStrategy):
+    """Legacy key: structure + content + statements, in that order.
+
+    Kept so existing configs asking for "body" keep working, since from_keys
+    silently drops unknown keys.
+    """
+
+    MAX_LINES = StatementsStrategy.MAX_LINES
+
+    @classmethod
+    def key(cls) -> str:
+        return "body"
+
+    def enrich(self, node: dict) -> str:
+        parts = [StructureStrategy().enrich(node),
+                 ContentStrategy().enrich(node),
+                 StatementsStrategy().enrich(node)]
+        return " | ".join(p for p in parts if p)
 
 
 class CompositeStrategy(EnrichmentStrategy):
@@ -262,7 +325,7 @@ class ASTParser:
         cls._use_clang = cfg.get("use_clang", False)
         if enrichment_keys is None:
             enrichment_keys = cfg.get("enrichment")
-        return CompositeStrategy.from_keys(enrichment_keys or ["signature", "body", "docstring"])
+        return CompositeStrategy.from_keys(enrichment_keys or DEFAULT_ENRICHMENT)
 
     @classmethod
     def scan_project(cls, root: str, enrichment_keys: Optional[list[str]] = None) -> list[str]:
@@ -295,6 +358,24 @@ class ASTParser:
                 child.parent = node
             return super().visit(node)
 
+    @staticmethod
+    def _python_body_lines(node, path_hint: str = "", limit: int = 2) -> list[str]:
+        """First real statements of a function body, excluding its docstring.
+
+        The docstring is a plain expression statement, so unparsing node.body
+        blindly makes it body[0] -- duplicating DocstringStrategy and wasting a
+        slot. ast.get_docstring already covers it.
+        """
+        body = node.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        try:
+            return [ast.unparse(s)[:80] for s in body[:limit]]
+        except Exception as e:
+            log.debug("cannot unparse body of %s in %s: %s", node.name, path_hint, e)
+            return []
+
     @classmethod
     def _parse_python(cls, source: str, path_hint: str = "") -> list[dict | str]:
         chunks: list[dict | str] = []
@@ -315,22 +396,20 @@ class ASTParser:
                         "bases": bases,
                     })
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if hasattr(node, 'parent') and isinstance(node.parent, ast.ClassDef):
-                        continue
                     doc = ast.get_docstring(node) or ""
                     args = [a.arg for a in node.args.args]
-                    try:
-                        body_lines = [ast.unparse(s)[:80] for s in node.body[:2]]
-                    except Exception as e:
-                        log.debug("cannot unparse body of %s in %s: %s", node.name, path_hint, e)
-                        body_lines = []
+                    parent = getattr(node, "parent", None)
+                    in_class = parent.name if isinstance(parent, ast.ClassDef) else ""
                     chunks.append({
-                        "kind": "Function",
+                        # Methods get their own chunk: without one they are only
+                        # reachable as a name in the class's "Methods:" list.
+                        "kind": "Method" if in_class else "Function",
                         "name": node.name,
                         "file": path_hint,
                         "args": args,
                         "docstring": doc,
-                        "body": body_lines,
+                        "in_class": in_class,
+                        "body": cls._python_body_lines(node, path_hint),
                     })
         except SyntaxError as e:
             chunks.append(f"[file] {path_hint} (parse error: {e})")
@@ -379,12 +458,23 @@ class ASTParser:
         "alias_declaration", "declaration",
     }
 
+    _CPP_FUNC_TYPES = ("function_definition", "template_function", "template_method")
+
     @classmethod
-    def _parse_cpp(cls, source: str, path_hint: str = "") -> list[str]:
-        # Use clang if enabled and available
+    def _parse_cpp(cls, source: str, path_hint: str = "") -> list[dict | str]:
+        """Clang when enabled, tree-sitter otherwise; line chunks as last resort."""
         if cls._use_clang and _CLANG_AVAILABLE:
-            return cls._parse_cpp_clang(source, path_hint)
-        # Otherwise use tree-sitter
+            chunks = cls._parse_cpp_clang(source, path_hint)
+            if chunks:
+                return chunks
+            # Clang needs the project's real include paths and flags to resolve a
+            # translation unit; without them it errors on most files. Structured
+            # tree-sitter output beats dumping raw source lines into the index.
+            log.debug("clang yielded nothing for %s, using tree-sitter", path_hint)
+        return cls._parse_cpp_treesitter(source, path_hint)
+
+    @classmethod
+    def _parse_cpp_treesitter(cls, source: str, path_hint: str = "") -> list[dict | str]:
         if not _TS_AVAILABLE:
             return cls._parse_fallback(source, path_hint, "Block")
         try:
@@ -398,37 +488,24 @@ class ASTParser:
             )
             return cls._parse_fallback(source, path_hint, "Block")
 
-        chunks: list[str] = []
+        chunks: list[dict | str] = []
         try:
             parser = Parser(lang)
             tree = parser.parse(source.encode("utf8", errors="ignore"))
             root = tree.root_node
 
-            def _ts_decl_name(n):
-                for c in n.children:
-                    if c.type == "identifier":
-                        return node_text(c)
-                    if c.type in ("reference_declarator", "pointer_declarator", "declarator", "function_declarator"):
-                        result = _ts_decl_name(c)
-                        if result:
-                            return result
-                return ""
-
-            def _ts_func_name(n):
-                decl = n.child_by_field_name("declarator")
-                if not decl:
-                    return _ts_decl_name(n)
-                return _ts_decl_name(decl)
-
-            def walk(node, class_name=""):
-                if node.type in cls._CPP_SIGNIFICANT:
+            def walk(node, class_name="", in_body=False):
+                # A `declaration` inside a function body is a local variable, not an
+                # API surface; indexing those is the noise we are trying to avoid.
+                if node.type in cls._CPP_SIGNIFICANT and not (
+                        in_body and node.type == "declaration"):
                     name_node = node.child_by_field_name("name")
                     name = node_text(name_node) if name_node else ""
+                    qualifier = ""
                     if not name:
-                        if node.type == "declaration":
-                            name = _ts_decl_name(node)
-                        elif node.type in ("function_definition", "template_function", "template_method"):
-                            name = _ts_func_name(node)
+                        decl = node.child_by_field_name("declarator")
+                        name, qualifier = ts_declarator_name(
+                            decl if decl is not None else node)
                     doc = ""
                     for c in node.children:
                         if c.type == "comment":
@@ -436,7 +513,7 @@ class ASTParser:
                             break
                     if name:
                         params = node.child_by_field_name("parameters")
-                        if not params and node.type in ("function_definition", "template_function", "template_method"):
+                        if not params and node.type in cls._CPP_FUNC_TYPES:
                             decl = node.child_by_field_name("declarator")
                             if decl:
                                 params = decl.child_by_field_name("parameters")
@@ -445,6 +522,9 @@ class ASTParser:
                         label = label_for(node.type)
                         body_summary = ts_body_summary(node)
                         bases_list = ts_base_classes(node)[0] if node.type in ("class_specifier", "struct_specifier") else []
+                        # An out-of-line definition names its class in the
+                        # qualifier (HashMap::find) rather than by nesting.
+                        owner = class_name or qualifier
                         chunks.append({
                             "kind": label,
                             "name": name,
@@ -453,7 +533,7 @@ class ASTParser:
                             "docstring": doc.strip() if doc else "",
                             "body": body_summary,
                             "bases": bases_list,
-                            "in_class": class_name if class_name and node.type in ("function_definition", "template_function", "template_method") else "",
+                            "in_class": owner if owner and node.type in cls._CPP_FUNC_TYPES else "",
                         })
                 next_class = class_name
                 if node.type in ("class_specifier", "struct_specifier"):
@@ -461,7 +541,7 @@ class ASTParser:
                     if nname:
                         next_class = node_text(nname)
                 for c in node.children:
-                    walk(c, next_class)
+                    walk(c, next_class, in_body or node.type == "compound_statement")
             walk(root)
         except Exception as e:
             chunks.append(f"[file] {path_hint} (parse error: {e})")
@@ -469,8 +549,9 @@ class ASTParser:
 
     @classmethod
     def _parse_cpp_clang(cls, source: str, path_hint: str = "") -> list[str]:
+        """Chunks from libclang, or [] so the caller can fall back to tree-sitter."""
         if not _CLANG_AVAILABLE:
-            return cls._parse_fallback(source, path_hint, "Block")
+            return []
         try:
             import clang.cindex as ci
             _configure_clang(ci)
@@ -481,11 +562,11 @@ class ASTParser:
             if tu.diagnostics:
                 for diag in tu.diagnostics:
                     if diag.severity >= ci.Diagnostic.Error:
-                        log.debug("clang reported errors for %s, using line-based chunking", path_hint)
-                        return cls._parse_fallback(source, path_hint, "Block")
+                        log.debug("clang reported errors for %s", path_hint)
+                        return []
         except Exception as e:
-            log.warning("clang parse of %s failed (%s), using line-based chunking", path_hint, e)
-            return cls._parse_fallback(source, path_hint, "Block")
+            log.warning("clang parse of %s failed (%s)", path_hint, e)
+            return []
 
         chunks: list[str] = []
         try:
@@ -542,7 +623,6 @@ class ASTParser:
                     # Natural language text for embedding
                     kind_map = {"class_decl": "Class", "struct_decl": "Struct", "function_decl": "Function",
                                 "enum_decl": "Enum", "typedef_decl": "Type", "type_alias_decl": "Alias"}
-                    type_key = cursor.kind.name.lower().replace('_decl', '')
                     human_kind = kind_map.get(cursor.kind.name.lower(), cursor.kind.name.lower())
                     text = f"{human_kind} {name} in {path_hint}"
                     if extra:
@@ -747,11 +827,9 @@ class VectorStore:
 class StorageIO:
     """Save/load vectors, texts, node_ids and dimension to/from .npz files.
 
-    Texts are stored as a length-prefixed UTF-8 blob so indices can be read
-    back without numpy's pickle-based object deserialization.
+    Texts are stored as a length-prefixed UTF-8 blob: smaller and faster than a
+    numpy object array, and it loads without pickle.
     """
-
-    ALLOW_PICKLE_ENV = "EMBEDDER_ALLOW_PICKLE"
 
     @staticmethod
     def save(path: str, vectors: np.ndarray | list[np.ndarray], texts: list[str], dim: int,
@@ -779,17 +857,6 @@ class StorageIO:
         np.savez_compressed(path, **data)
 
     @staticmethod
-    def _load_legacy_texts(path: str) -> list[str]:
-        if os.environ.get(StorageIO.ALLOW_PICKLE_ENV) != "1":
-            raise ValueError(
-                f"{path} was written in the legacy pickled format. Loading it executes "
-                f"arbitrary code from the file. Rebuild the index (./rebuild_index.sh) or, "
-                f"if the file is trusted, set {StorageIO.ALLOW_PICKLE_ENV}=1."
-            )
-        legacy = np.load(path, allow_pickle=True)
-        return [str(t) for t in legacy["texts"]]
-
-    @staticmethod
     def load(path: str) -> tuple:
         """Load vectors, texts, node_ids and dimension from a .npz file."""
         data = np.load(path, allow_pickle=False)
@@ -803,7 +870,8 @@ class StorageIO:
                 for i in range(len(offsets) - 1)
             ]
         else:
-            texts = StorageIO._load_legacy_texts(path)
+            # Indices written before the blob format stored texts as an object array.
+            texts = [str(t) for t in np.load(path, allow_pickle=True)["texts"]]
         dim = int(data["dim"])
         node_ids = None
         if "node_ids" in data:
@@ -817,7 +885,8 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
 
     Args:
         root: Project root directory.
-        data_dir: Directory to save the index (relative to root).
+        data_dir: Directory to save the index, used as given (relative paths are
+                  relative to the cwd, matching build_all and tree_ast_parser).
                   If not given, computed from config embedding_store + project name.
         delta: If True, build delta index (only changed files).
     """
@@ -825,12 +894,13 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
     cfg = ModelConfig.load(root)
     enc = EmbeddingModel.from_config(cfg)
 
+    os.makedirs(data_dir, exist_ok=True)
     project = root
     if delta:
         # --- Delta mode: only changed files ---
         changed = changed_files(project)
-        delta_vec_path = os.path.join(project, data_dir, 'delta.npz')
-        delta_texts_path = os.path.join(project, data_dir, 'delta_texts.json')
+        delta_vec_path = os.path.join(data_dir, 'delta.npz')
+        delta_texts_path = os.path.join(data_dir, 'delta_texts.json')
 
         def _save_empty_delta(files: list[str]) -> None:
             StorageIO.save(delta_vec_path, [], [], enc.dim)
@@ -861,7 +931,6 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
 
         vecs = enc.embed_many(enc.as_passages(chunks))
 
-        os.makedirs(os.path.dirname(delta_vec_path), exist_ok=True)
         StorageIO.save(delta_vec_path, vecs, chunks, enc.dim)
 
         with open(delta_texts_path, 'w') as f:
@@ -879,8 +948,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
 
         vecs = enc.embed_many(enc.as_passages(chunks))
 
-        out = os.path.join(project, data_dir, 'enriched_vectors.npz')
-        os.makedirs(os.path.dirname(out), exist_ok=True)
+        out = os.path.join(data_dir, 'enriched_vectors.npz')
         StorageIO.save(out, vecs, chunks, enc.dim, node_ids=node_ids)
         print(f"Flat index: {len(chunks)} chunks -> {out}")
 

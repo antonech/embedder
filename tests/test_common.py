@@ -56,6 +56,34 @@ def test_model_config_load_prefers_project_config(tmp_path, monkeypatch):
     assert common.ModelConfig.load(str(tmp_path / "elsewhere")).model_name == "own-model"
 
 
+def _cpp_root(src: str):
+    from tree_sitter import Language, Parser
+    import tree_sitter_cpp
+
+    return Parser(Language(tree_sitter_cpp.language())).parse(src.encode()).root_node
+
+
+@pytest.mark.parametrize(
+    "src,expected",
+    [
+        ("int HashMap::find(int key) { return 0; }", ("find", "HashMap")),
+        ("void Outer::Inner::run() {}", ("run", "Inner")),
+        ("int add(int a, int b) { return a; }", ("add", "")),
+        ("int* make() { return 0; }", ("make", "")),
+        ("int& ref() { static int x; return x; }", ("ref", "")),
+        ("bool operator==(const A& a, const A& b) { return true; }", ("operator==", "")),
+    ],
+)
+def test_ts_declarator_name(src, expected):
+    fn = _cpp_root(src).children[0]
+    decl = fn.child_by_field_name("declarator")
+    assert common.ts_declarator_name(decl if decl is not None else fn) == expected
+
+
+def test_ts_declarator_name_without_a_name():
+    assert common.ts_declarator_name(_cpp_root("int;\n")) == ("", "")
+
+
 def test_format_chunk_without_prefix():
     assert common.format_chunk({}, "body") == "body"
     assert common.format_chunk({"kind": "Class", "file": "a.py", "name": "A"}, "") == "Class a.py A"

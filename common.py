@@ -143,6 +143,47 @@ def ts_template_params(node) -> str:
     return ""
 
 
+def _ts_qualified_parts(node) -> tuple[str, str]:
+    """(innermost scope, name) of a possibly nested qualified_identifier.
+
+    `Outer::Inner::run` nests right, so recurse to reach the class that actually
+    owns the member: ('Inner', 'run').
+    """
+    scope = node.child_by_field_name("scope")
+    name = node.child_by_field_name("name")
+    scope_text = node_text(scope) if scope is not None else ""
+    if name is not None and name.type == "qualified_identifier":
+        inner_scope, inner_name = _ts_qualified_parts(name)
+        return (inner_scope or scope_text), inner_name
+    return scope_text, node_text(name) if name is not None else ""
+
+
+def ts_declarator_name(node) -> tuple[str, str]:
+    """(name, owning class) for a C++ declarator subtree.
+
+    Handles out-of-line definitions (`int HashMap::find(int key) {...}`), which
+    carry their name inside a qualified_identifier rather than a plain identifier
+    and would otherwise be skipped entirely for having no name.
+    """
+    if node.type in ("identifier", "field_identifier", "operator_name"):
+        return node_text(node), ""
+    if node.type == "qualified_identifier":
+        scope, name = _ts_qualified_parts(node)
+        return name, scope
+    for c in node.children:
+        if c.type in ("identifier", "field_identifier", "operator_name"):
+            return node_text(c), ""
+        if c.type == "qualified_identifier":
+            scope, name = _ts_qualified_parts(c)
+            return name, scope
+        if c.type in ("reference_declarator", "pointer_declarator", "declarator",
+                      "function_declarator"):
+            name, scope = ts_declarator_name(c)
+            if name:
+                return name, scope
+    return "", ""
+
+
 def _ts_method_entry(node, access: str) -> Optional[str]:
     name_node = node.child_by_field_name("name")
     params = node.child_by_field_name("parameters")

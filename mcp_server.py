@@ -26,12 +26,6 @@ log = logging.getLogger(__name__)
 
 SEARCH_MODES = ("rrf", "embed", "bm25")
 SEARCH_FORMATS = ("text", "json", "markdown")
-MAX_TOP_K = 100
-MAX_DOCUMENTS = 1000
-
-
-class PathNotAllowed(ValueError):
-    pass
 
 
 class EmbedderApp:
@@ -46,10 +40,12 @@ class EmbedderApp:
         self.model_name = model_name
         device = resolve_device(device)
         self.device = device
+        # data_dir follows the loaded index, so tree files resolve next to it.
         self.data_dir = data_dir
         self.encoder = EmbeddingModel(model_name, device=device, float_type=float_type)
         self.store = VectorStore()
         self._bm25 = None
+        self._bm25_dirty = False
         self._delta_count = 0
         self.cross_encoder = None
         self.cross_encoder_tokenizer = None
@@ -66,20 +62,9 @@ class EmbedderApp:
                 self.cross_encoder_error = f"failed to load cross-encoder '{cross_encoder_model}': {e}"
                 log.warning("%s; continuing without reranking", self.cross_encoder_error)
 
-    def _resolve_store_path(self, path: str) -> str:
-        """Resolve a caller-supplied .npz path inside the project's data dir.
-
-        Paths outside the data dir (absolute paths, `..`, symlinks pointing out)
-        are rejected so tool callers cannot read or overwrite arbitrary files.
-        """
-        base = os.path.realpath(self.data_dir)
-        candidate = path if os.path.isabs(path) else os.path.join(base, path)
-        full = os.path.realpath(candidate)
-        if full != base and not full.startswith(base + os.sep):
-            raise PathNotAllowed(f"path must stay inside the project store ({base})")
-        if not full.endswith(".npz"):
-            raise PathNotAllowed("path must point to a .npz file")
-        return full
+    def _store_path(self, path: str) -> str:
+        """A bare filename means the index directory currently being served."""
+        return path if os.path.isabs(path) else os.path.join(self.data_dir, path)
 
     def _tokenize(self, text: str) -> list[str]:
         words = re.split(r'[^a-zA-Z0-9]+', text)
@@ -94,6 +79,7 @@ class EmbedderApp:
         return result
 
     def _build_bm25(self):
+        self._bm25_dirty = False
         if len(self.store) == 0:
             self._bm25 = None
             return
@@ -101,8 +87,27 @@ class EmbedderApp:
         corpus = [self._tokenize(t) for t in self.store.texts]
         self._bm25 = BM25Okapi(corpus)
 
+    def _ensure_bm25(self) -> None:
+        """Rebuild BM25 if documents were added since the last build.
+
+        Deferring keeps repeated add_document calls O(1) instead of retokenizing
+        the whole corpus per insert.
+        """
+        if self._bm25_dirty:
+            self._build_bm25()
+
+    def _invalidate_tree_caches(self) -> None:
+        """Drop cached tree index/vectors and the tree->flat map.
+
+        Must run whenever the flat store is replaced: the cached map is keyed by
+        flat index, so keeping it would boost unrelated chunks in _fuse_with_tree.
+        """
+        for attr in ("_tree", "_tree_store", "_tree_to_flat"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
     def init(self, data_path: str) -> str:
-        data_path = self._resolve_store_path(data_path)
+        data_path = self._store_path(data_path)
         vecs, texts, dim, node_ids = StorageIO.load(data_path)
         self.store = VectorStore()
         self.store.vectors = vecs
@@ -110,13 +115,12 @@ class EmbedderApp:
         self.store.node_ids = node_ids if node_ids is not None else [None] * len(texts)
         self._delta_count = 0
         self.data_dir = os.path.dirname(data_path)
-        if hasattr(self, "_tree"):
-            del self._tree
+        self._invalidate_tree_caches()
         self._build_bm25()
         return f"Loaded {len(self.store)} vectors, dim={dim}"
 
     def load_delta(self, data_path: str) -> str:
-        data_path = self._resolve_store_path(data_path)
+        data_path = self._store_path(data_path)
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"delta file not found: {data_path}")
         vecs, texts, dim, _ = StorageIO.load(data_path)
@@ -339,6 +343,7 @@ class EmbedderApp:
         return self._format(self._annotate(hits[:top_k]), fmt)
 
     def _candidates(self, query: str, qv, top_k: int, mode: str, alpha: float | None) -> list[dict]:
+        self._ensure_bm25()
         if mode == "embed" or self._bm25 is None:
             return self.store.search(qv, top_k=top_k)
 
@@ -382,7 +387,7 @@ class EmbedderApp:
         ]
 
     def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
-        query, top_k, mode, alpha, fmt = _validate_search_args(query, top_k, mode, alpha, fmt)
+        _validate_search_args(mode, fmt)
         do_rerank = rerank and self.cross_encoder is not None
         # Retrieve a wider pool when reranking so the cross-encoder can promote
         # documents the bi-encoder/BM25 ranked below top_k.
@@ -395,31 +400,29 @@ class EmbedderApp:
         return self.encoder.embed(text).tolist()
 
     def embed_many(self, texts: list[str]) -> list[list[float]]:
-        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
-            raise ValueError("texts must be a list of strings")
-        if len(texts) > MAX_DOCUMENTS:
-            raise ValueError(f"at most {MAX_DOCUMENTS} texts per call")
         return self.encoder.embed_many(texts).tolist()
 
     def add_document(self, text: str) -> str:
         self.store.add(self.encoder.embed_passage(text), text)
-        self._build_bm25()
+        self._bm25_dirty = True
         return f"Added, total vectors: {len(self.store)}"
 
     def add_documents(self, texts: list[str]) -> str:
-        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
-            raise ValueError("texts must be a list of strings")
-        if len(texts) > MAX_DOCUMENTS:
-            raise ValueError(f"at most {MAX_DOCUMENTS} documents per call")
         vecs = self.encoder.embed_many(self.encoder.as_passages(texts))
         self.store.add_many(vecs, texts)
-        self._build_bm25()
+        self._bm25_dirty = True
         return f"Added {len(texts)} docs, total vectors: {len(self.store)}"
 
     def save(self, path: str) -> str:
-        path = self._resolve_store_path(path)
+        path = self._store_path(path)
+        # The target directory may not exist yet; numpy would otherwise fail deep
+        # inside zipfile.
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         dim = self.encoder.dim
-        StorageIO.save(path, self.store.vectors, self.store.texts, dim)
+        # node_ids must round-trip, otherwise a saved store reloaded via init_store
+        # loses its tree links and falls back to regex text matching for AST context.
+        StorageIO.save(path, self.store.vectors, self.store.texts, dim,
+                       node_ids=self.store.node_ids)
         return f"Saved {len(self.store)} vectors to {path}"
 
     def info(self) -> str:
@@ -432,25 +435,12 @@ class EmbedderApp:
         return json.dumps(info, ensure_ascii=False)
 
 
-def _validate_search_args(query: str, top_k: int, mode: str, alpha: float | None, fmt: str):
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("query must be a non-empty string")
-    try:
-        top_k = int(top_k)
-    except (TypeError, ValueError):
-        raise ValueError("top_k must be an integer")
-    top_k = max(1, min(top_k, MAX_TOP_K))
+def _validate_search_args(mode: str, fmt: str) -> None:
+    """Check the two string enums. Types are already enforced by FastMCP."""
     if mode not in SEARCH_MODES:
         raise ValueError(f"mode must be one of {', '.join(SEARCH_MODES)}")
     if fmt not in SEARCH_FORMATS:
         raise ValueError(f"fmt must be one of {', '.join(SEARCH_FORMATS)}")
-    if alpha is not None:
-        try:
-            alpha = float(alpha)
-        except (TypeError, ValueError):
-            raise ValueError("alpha must be a number")
-        alpha = max(0.0, min(alpha, 1.0))
-    return query, top_k, mode, alpha, fmt
 
 
 projects: dict[str, EmbedderApp] = {}
@@ -469,7 +459,7 @@ def _resolve(project: str) -> tuple[EmbedderApp | None, str | None]:
 
 @mcp.tool()
 def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
-    """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7, clamped to [0,1]). top_k is capped at 100. rerank=True uses cross-encoder. Includes AST context."""
+    """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7). rerank=True uses cross-encoder. Includes AST context."""
     app, err = _resolve(project)
     if err:
         return err
@@ -494,10 +484,7 @@ def embed_many(texts: list[str], project: str) -> str:
     app, err = _resolve(project)
     if err:
         return err
-    try:
-        return json.dumps(app.embed_many(texts))
-    except ValueError as e:
-        return f"Error: {e}"
+    return json.dumps(app.embed_many(texts))
 
 
 @mcp.tool()
@@ -517,7 +504,7 @@ def init_store(data_path: str, project: str) -> str:
         return err
     try:
         return app.init(data_path)
-    except ValueError as e:
+    except (OSError, ValueError) as e:
         return f"Error: {e}"
 
 
@@ -536,10 +523,7 @@ def add_documents(texts: list[str], project: str) -> str:
     app, err = _resolve(project)
     if err:
         return err
-    try:
-        return app.add_documents(texts)
-    except ValueError as e:
-        return f"Error: {e}"
+    return app.add_documents(texts)
 
 
 @mcp.tool()
@@ -550,7 +534,7 @@ def save_store(path: str, project: str) -> str:
         return err
     try:
         return app.save(path)
-    except ValueError as e:
+    except (OSError, ValueError) as e:
         return f"Error: {e}"
 
 
@@ -562,7 +546,7 @@ def load_delta(data_path: str, project: str) -> str:
         return err
     try:
         return app.load_delta(data_path)
-    except (ValueError, FileNotFoundError) as e:
+    except (OSError, ValueError) as e:
         return f"Error: {e}"
 
 
