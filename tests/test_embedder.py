@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import common
+from common import iter_tree_index
 import embedder
 from embedder import (
     ASTParser,
@@ -552,6 +553,36 @@ def test_vector_store_array_cache_invalidated_on_add():
     assert store._get_array().shape == (2, 2)
 
 
+def test_vector_store_keeps_one_matrix():
+    """vectors must not be a second copy of the search matrix."""
+    store = VectorStore()
+    store.vectors = np.stack([_unit(1, 0), _unit(0, 1)])
+    store.texts = ["a", "b"]
+    store.node_ids = [None, None]
+    assert store.vectors is store._get_array()
+    assert store.dim == 2 and len(store) == 2
+
+    store.add_many(np.stack([_unit(1, 1)]), ["c"])
+    assert len(store) == 3          # counted before the append is folded in
+    assert store._get_array().shape == (3, 2)
+    assert store.search(_unit(1, 1), top_k=1)[0]["text"] == "c"
+
+
+def test_vector_store_truncate_drops_the_tail():
+    store = VectorStore()
+    store.add_many(np.stack([_unit(1, 0), _unit(0, 1)]), ["a", "b"], [7, None])
+    store.truncate(1)
+    assert len(store) == 1 and store.texts == ["a"] and store.node_ids == [7]
+    assert store._get_array().shape == (1, 2)
+    assert store.search(_unit(0, 1), top_k=2)[0]["text"] == "a"
+
+
+def test_vector_store_empty_search_and_dim():
+    store = VectorStore()
+    assert len(store) == 0 and store.dim == 0
+    assert store.search(_unit(1, 0)) == []
+
+
 # --- StorageIO ---
 
 def test_storage_roundtrip_with_node_ids(tmp_path):
@@ -578,7 +609,7 @@ def test_storage_save_empty(tmp_path):
     path = str(tmp_path / "vecs.npz")
     StorageIO.save(path, [], [], dim=3)
     vecs, texts, dim, node_ids = StorageIO.load(path)
-    assert vecs == [] and texts == [] and dim == 3 and node_ids is None
+    assert len(vecs) == 0 and texts == [] and dim == 3 and node_ids is None
 
 
 # --- build_flat_index ---
@@ -776,8 +807,8 @@ def test_build_all_writes_tree_and_flat_indices(tmp_path, fake_st):
     ASTParser._use_clang = False
 
     assert (data_dir / "tree_vectors.npz").exists()
-    tree = json.loads((data_dir / "tree_index.json").read_text())
-    assert [n["name"] for n in tree["nodes"]] == ["Service", "create", "fetch"]
+    tree = list(iter_tree_index(str(data_dir / "tree_index.json")))
+    assert [n["name"] for n, _text in tree] == ["Service", "create", "fetch"]
 
     _, texts, dim, node_ids = StorageIO.load(str(data_dir / "enriched_vectors.npz"))
     assert dim == fake_st.DIM

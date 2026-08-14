@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from common import write_tree_index
 from tree_search import TreeIndex
 
 
@@ -34,6 +35,30 @@ def data_dir(tmp_path):
     return tmp_path
 
 
+def test_reads_the_json_lines_format(tmp_path):
+    nodes = [
+        _node(0, "Service", type="class_definition", start=1, end=20),
+        _node(1, "create", parent_id=0, start=2, end=5),
+    ]
+    write_tree_index(str(tmp_path / "tree_index.json"), nodes, [n["text"] for n in nodes])
+
+    idx = TreeIndex(data_dir=str(tmp_path))
+    assert len(idx.nodes) == 2
+    assert idx.texts == [n["text"] for n in nodes]
+    assert idx.get_parent(1)["name"] == "Service"
+    assert idx.match_node("class_definition a.py Service")["_uid"] == 0
+
+
+def test_nodes_are_slots_not_dicts(data_dir):
+    """A dict per node cost ~270 MB on a 100k-node index; slots keep it usable."""
+    idx = TreeIndex(data_dir=str(data_dir))
+    node = idx.nodes[0]
+    assert not isinstance(node, dict)
+    assert not hasattr(node, "__dict__")
+    with pytest.raises(KeyError):
+        node["docstring"]
+
+
 def test_empty_dir_yields_empty_index(tmp_path):
     idx = TreeIndex(data_dir=str(tmp_path))
     assert idx.nodes == {}
@@ -49,7 +74,10 @@ def test_loads_nodes_texts_and_lookup(data_dir):
     # internal id/parent_id keys are normalized to uids
     assert idx.nodes[1]["parent_id"] == 0
     assert idx.nodes[0]["parent_id"] == -1
+    assert idx.nodes[0]["_uid"] == 0
     assert "_shifted_parent_id" not in idx.nodes[0]
+    assert "id" not in idx.nodes[0]
+    assert idx.nodes[0].get("docstring", "unset") == "unset"
 
 
 def test_relations(data_dir):
@@ -124,11 +152,6 @@ def test_annotate_adds_context(data_dir):
     assert "context" not in hits[2]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: _load() re-walks all nodes on the second call, and main-index nodes "
-    "no longer carry _shifted_parent_id, so their parent links are reset to -1",
-)
 def test_delta_index_is_merged_without_id_collisions(data_dir):
     delta_nodes = [
         _node(0, "Extra", file="b.py", type="class_definition"),

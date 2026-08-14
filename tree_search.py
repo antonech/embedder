@@ -1,4 +1,48 @@
-import json, os, re
+import os, re, sys
+
+from common import iter_tree_index
+
+
+class TreeNode:
+    """One AST node, kept as slots instead of a dict.
+
+    The parsed JSON node carries eleven keys of which only these are ever read;
+    holding the raw dicts cost ~270 MB for a 100k-node index against ~20 MB of
+    actual character data. A node's chunk text stays available as
+    `TreeIndex.texts[uid]`.
+    """
+
+    __slots__ = ("uid", "name", "type", "file", "start_line", "end_line", "parent_id")
+    _ALIASES = {"_uid": "uid"}
+
+    def __init__(self, uid: int, name: str, type: str, file: str,
+                 start_line: int, end_line: int, parent_id: int = -1):
+        self.uid = uid
+        self.name = name
+        self.type = type
+        self.file = file
+        self.start_line = start_line
+        self.end_line = end_line
+        self.parent_id = parent_id
+
+    # Mapping access so callers can keep using node["name"] / node.get("parent_id", -1).
+    def __getitem__(self, key: str):
+        try:
+            return getattr(self, self._ALIASES.get(key, key))
+        except AttributeError:
+            raise KeyError(key) from None
+
+    def __contains__(self, key: str) -> bool:
+        return self._ALIASES.get(key, key) in self.__slots__
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __repr__(self) -> str:
+        return f"TreeNode(uid={self.uid}, name={self.name!r}, file={self.file!r})"
 
 
 class TreeIndex:
@@ -53,7 +97,7 @@ class TreeIndex:
                 return uid
         return uids[0]
 
-    def match_node(self, text: str) -> dict | None:
+    def match_node(self, text: str) -> "TreeNode | None":
         m = re.match(r'^\S+\s+(\S+)\s+(\S+)', text)
         if not m:
             return None
@@ -89,65 +133,56 @@ class TreeIndex:
         return hits
 
     def _load(self, tree_path, start_uid=0, id_shift=0):
-        try:
-            with open(tree_path) as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            raise RuntimeError(f"cannot read tree index {tree_path}: {e}") from e
-        for key in ("nodes", "texts"):
-            if key not in data:
-                raise RuntimeError(f"tree index {tree_path} is missing '{key}'")
-
         uid = start_uid
         max_original_id_without_shift = -1
-        for n in data["nodes"]:
+        # Only the nodes from this file get their parents resolved below. The
+        # previous version re-walked every loaded node on the second call, by
+        # which point main-index nodes had lost their shifted parent id, so
+        # loading a delta reset the whole main index to parent_id -1.
+        pending: list[tuple[TreeNode, int]] = []
+        for n, text in iter_tree_index(tree_path):
             original_id = n["id"]
             if original_id > max_original_id_without_shift:
                 max_original_id_without_shift = original_id
-            shifted_id = original_id + id_shift
             original_parent_id = n.get("parent_id", -1)
-            n["_shifted_parent_id"] = original_parent_id + id_shift if original_parent_id != -1 else -1
-            n.pop("id", None)
-            n.pop("parent_id", None)
-            n["_uid"] = uid
-            self.nodes[uid] = n
-            self.id_map[shifted_id] = uid
+            node = TreeNode(
+                uid,
+                n.get("name", ""),
+                sys.intern(n.get("type", "")),
+                sys.intern(n.get("file", "")),
+                n.get("start_line", 0),
+                n.get("end_line", 0),
+            )
+            self.nodes[uid] = node
+            self.id_map[original_id + id_shift] = uid
+            self.texts.append(text)
+            pending.append(
+                (node, original_parent_id + id_shift if original_parent_id != -1 else -1)
+            )
             uid += 1
 
-        self.texts.extend(data["texts"])
-
-        for n in self.nodes.values():
-            shifted_parent_id = n.get("_shifted_parent_id", -1)
+        for node, shifted_parent_id in pending:
             if shifted_parent_id == -1:
-                n["parent_id"] = -1
-            else:
-                n["parent_id"] = self.id_map.get(shifted_parent_id, -1)
-            n.pop("_shifted_parent_id", None)
-
-        self.children = {}
-        for nid, n in self.nodes.items():
-            parent_uid = n.get("parent_id", -1)
-            if parent_uid == -1:
                 continue
-            if parent_uid not in self.children:
-                self.children[parent_uid] = []
-            self.children[parent_uid].append(nid)
+            node.parent_id = self.id_map.get(shifted_parent_id, -1)
+            if node.parent_id != -1:
+                self.children.setdefault(node.parent_id, []).append(node.uid)
 
         return uid, max_original_id_without_shift
 
-    def get_node(self, node_id: int) -> dict | None:
+    def get_node(self, node_id: int) -> "TreeNode | None":
         return self.nodes.get(node_id)
 
-    def get_children(self, node_id: int) -> list[dict]:
+    def get_children(self, node_id: int) -> "list[TreeNode]":
         return [self.nodes[cid] for cid in self.children.get(node_id, []) if cid in self.nodes]
 
-    def get_parent(self, node_id: int) -> dict | None:
+    def get_parent(self, node_id: int) -> "TreeNode | None":
         n = self.nodes.get(node_id)
         if n and n.get("parent_id", -1) >= 0:
             return self.nodes.get(n["parent_id"])
         return None
 
-    def get_siblings(self, node_id: int) -> list[dict]:
+    def get_siblings(self, node_id: int) -> "list[TreeNode]":
         n = self.nodes.get(node_id)
         if not n or n.get("parent_id", -1) < 0:
             return []

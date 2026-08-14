@@ -151,6 +151,15 @@ should go red:
   Only `mode` and `fmt` are validated by hand, since the type hints cannot express those enums.
 - `save_store` persists `node_ids`; otherwise a save→`init_store` round-trip loses tree links and
   AST context silently degrades to regex text matching.
+- `VectorStore` keeps one `(N, dim)` matrix: `store.vectors` is that array (a property), not a list.
+  Appends go through `add`/`add_many` and are folded in on the next read; `truncate(n)` drops the
+  tail. Anything doing `store.vectors.extend(...)` or slicing it in place is a regression back to
+  holding the same vectors twice — assert `store.vectors is store._get_array()`.
+- `tree_index.json` is JSON Lines (`common.write_tree_index` / `common.iter_tree_index`): header
+  line, then one node per line, `includes` deduplicated per file into the header. Read it with
+  `iter_tree_index` in tests, never `json.loads(path.read_text())`. Both pre-JSONL layouts
+  (compact and `indent=2`) must keep loading — the fixtures in `tests/test_tree_search.py` and
+  `tests/test_mcp_server.py` deliberately still write the old one.
 
 Expected (not a bug) — the delta index is **additive**, and `main()` auto-loads `delta.npz` at
 startup. A changed file's chunks therefore exist twice (stale base copy + fresh delta copy) and

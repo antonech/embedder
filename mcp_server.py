@@ -124,17 +124,12 @@ class EmbedderApp:
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"delta file not found: {data_path}")
         vecs, texts, dim, _ = StorageIO.load(data_path)
-        if len(self.store) > 0:
-            store_dim = int(self.store.vectors[0].shape[0])
-            if dim != store_dim:
-                raise ValueError(
-                    f"delta dimension {dim} does not match the store ({store_dim}); "
-                    f"rebuild the delta with the same model"
-                )
-        self.store.vectors.extend(vecs)
-        self.store.texts.extend(texts)
-        self.store.node_ids.extend([None] * len(texts))
-        self.store.invalidate_cache()
+        if len(self.store) > 0 and dim != self.store.dim:
+            raise ValueError(
+                f"delta dimension {dim} does not match the store ({self.store.dim}); "
+                f"rebuild the delta with the same model"
+            )
+        self.store.add_many(vecs, texts)
         self._delta_count = len(vecs)
         self._build_bm25()
         return f"Loaded {len(vecs)} delta vectors"
@@ -142,10 +137,7 @@ class EmbedderApp:
     def clear_delta(self) -> str:
         if self._delta_count < 1:
             return "No delta to clear"
-        self.store.vectors = self.store.vectors[:-self._delta_count]
-        self.store.texts = self.store.texts[:-self._delta_count]
-        self.store.node_ids = self.store.node_ids[:-self._delta_count]
-        self.store.invalidate_cache()
+        self.store.truncate(len(self.store) - self._delta_count)
         self._delta_count = 0
         self._build_bm25()
         return "Delta cleared"
