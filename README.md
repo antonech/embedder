@@ -115,9 +115,10 @@ Configured via `"cross_encoder_model"` in `config.json`. Recommended:
 
 - `cross-encoder/ms-marco-MiniLM-L-6-v2` — fast, good for code search
 
-On each reranked search, the cross-encoder scores (query, candidate) pairs through
-a BERT-style classification head and replaces the bi-encoder/BM25 scores with
-sigmoid-normalized relevance probabilities [0, 1]. Adds ~2ms per candidate on GPU.
+On each reranked search, retrieval widens to `top_k * RERANK_CANDIDATES` (4x) candidates
+and the cross-encoder scores (query, candidate) pairs through a BERT-style classification
+head, replacing the bi-encoder/BM25 scores with sigmoid-normalized relevance
+probabilities [0, 1] before truncating to `top_k`. Adds ~2ms per candidate on GPU.
 
 Usage: `search("query", rerank=True)` — defaults to auto (enabled if model loaded).
 
