@@ -8,9 +8,9 @@ from sentence_transformers import SentenceTransformer
 from common import (
     DEFAULT_EXCLUDE, LABELS as _LABELS, ModelConfig,
     SKIP_DIRS as _SKIP_DIRS, SKIP_PREFIXES as _SKIP_PREFIXES,
-    add_tree_context, changed_files, enrich_chunks, label_for, load_json,
-    node_text, resolve_data_dir, ts_base_classes, ts_body_summary,
-    ts_declarator_name,
+    add_tree_context, changed_files, enrich_chunks, label_for,
+    load_project_config, node_text, resolve_data_dir, ts_base_classes,
+    ts_body_summary, ts_declarator_name,
 )
 
 log = logging.getLogger(__name__)
@@ -321,7 +321,7 @@ class ASTParser:
 
     @classmethod
     def _load_strategy(cls, root: str, enrichment_keys: Optional[list[str]] = None) -> CompositeStrategy:
-        cfg = load_json(os.path.join(root, "config.json"))
+        cfg = load_project_config(os.path.join(root, "config.json"))
         cls._use_clang = cfg.get("use_clang", False)
         if enrichment_keys is None:
             enrichment_keys = cfg.get("enrichment")

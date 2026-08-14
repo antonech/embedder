@@ -27,14 +27,45 @@ def load_json(path: str) -> dict:
 
     A file that exists but cannot be read or parsed is an error: silently
     falling back to defaults would hide a broken config or labels file.
+    Use load_project_config() for a config.json the embedder does not own.
     """
     if not os.path.exists(path):
         return {}
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError) as e:
         raise RuntimeError(f"cannot read {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"cannot read {path}: expected a JSON object, got {type(data).__name__}")
+    return data
+
+
+CONFIG_KEYS = frozenset({
+    "model_name", "device", "query_prefix", "passage_prefix", "batch_size",
+    "float_type", "cross_encoder_model", "enrichment", "use_clang", "embedding_store",
+})
+
+
+def load_project_config(path: str) -> dict:
+    """Read a scanned project's config.json, or {} if it is not an embedder config.
+
+    A scanned repository may ship its own unrelated config.json (a list, JSON
+    with comments, application settings). Treating that as a broken embedder
+    config would abort the whole index build, and reading settings out of it
+    would embed with the wrong model, so warn and ignore it instead.
+    """
+    if not os.path.exists(path):
+        return {}
+    try:
+        cfg = load_json(path)
+    except RuntimeError as e:
+        log.warning("ignoring %s: %s", path, e)
+        return {}
+    if not cfg.keys() & CONFIG_KEYS:
+        log.warning("ignoring %s: it holds no embedder settings", path)
+        return {}
+    return cfg
 
 
 def load_labels() -> dict:
@@ -97,9 +128,9 @@ class ModelConfig:
     def load(cls, root: Optional[str] = None) -> "ModelConfig":
         """Load settings from <root>/config.json, falling back to the embedder's own config."""
         if root:
-            project_cfg_path = os.path.join(root, "config.json")
-            if os.path.exists(project_cfg_path):
-                return cls.from_dict(load_json(project_cfg_path))
+            project_cfg = load_project_config(os.path.join(root, "config.json"))
+            if project_cfg:
+                return cls.from_dict(project_cfg)
         return cls.from_dict(load_json(CONFIG_PATH))
 
 

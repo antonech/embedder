@@ -187,13 +187,15 @@ Statements exclude the docstring expression, so it is no longer indexed twice.
 {
     "model_name": "intfloat/e5-small-v2",
     "batch_size": 4096,
-    // "device": "cuda",       // uncomment for GPU-only; omit for auto multi (GPU+CPU) or CPU
     "enrichment": ["signature", "structure", "content", "docstring"],
     "use_clang": true,
     "embedding_store": "~/project/embedder_store",
     "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2"
 }
 ```
+
+Strict JSON — comments are not allowed. Add `"device": "cuda"` for GPU-only; omit
+`device` for auto (GPU+CPU `multi` if CUDA is available, else CPU).
 
 - `model_name` — sentence-transformers model (see [Models](#models) for compatible models)
 - `float_type` — `"fp16"` for half precision (faster, less VRAM) or `"fp32"` (default)
@@ -212,7 +214,14 @@ Statements exclude the docstring expression, so it is no longer indexed twice.
 - `query_prefix` / `passage_prefix` — override auto-detected E5/BGE instruction prefixes (set to `""` to disable)
 - `cross_encoder_model` — optional cross-encoder model for reranking (e.g. `cross-encoder/ms-marco-MiniLM-L-6-v2`); uses `device` setting
 
-Priority: explicit arg > config.json > defaults.
+Priority: explicit arg > `<--root>/config.json` > the embedder's own `config.json` > defaults.
+
+A scanned project may keep its own `config.json` to override model/enrichment settings for
+that project. A `config.json` that is not an embedder config (unrelated keys, comments,
+not a JSON object) is ignored with a warning on stderr — indexing an unrelated repository
+that happens to ship a `config.json` neither fails nor silently switches models. The
+embedder's own `config.json` and `labels.json` are still strict: a broken file there is an
+error, not a silent fallback.
 
 `--data-dir` is used as given by all builders (`--build-all`, `--build-flat`, `tree_ast_parser.py`);
 a relative value is relative to the current directory, not to `--root`. Prefer absolute paths.
