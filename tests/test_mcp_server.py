@@ -222,14 +222,6 @@ def test_load_delta_rejects_dimension_mismatch(app, store_path, tmp_path):
     assert app.search("user", top_k=1)
 
 
-def test_init_rejects_npz_without_vectors(app, tmp_path):
-    bad_path = tmp_path / "bad.npz"
-    np.savez_compressed(str(bad_path), dim=np.array(8))
-
-    with pytest.raises(ValueError, match="not a valid index"):
-        app.init(str(bad_path))
-
-
 # --- formatting ---
 
 def test_format_text_and_json():

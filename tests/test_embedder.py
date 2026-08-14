@@ -605,6 +605,13 @@ def test_storage_roundtrip_without_node_ids_and_from_array(tmp_path):
     assert node_ids is None
 
 
+def test_storage_load_reports_non_npz_file(tmp_path):
+    path = tmp_path / "notanindex.npz"
+    path.write_text("plain text, not an archive")
+    with pytest.raises(ValueError):
+        StorageIO.load(str(path))
+
+
 def test_storage_save_empty(tmp_path):
     path = str(tmp_path / "vecs.npz")
     StorageIO.save(path, [], [], dim=3)

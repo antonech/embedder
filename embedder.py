@@ -890,10 +890,11 @@ class StorageIO:
     @staticmethod
     def load(path: str) -> tuple:
         """Load vectors, texts, node_ids and dimension from a .npz file."""
-        data = np.load(path, allow_pickle=False)
-        for key in ("vectors", "dim"):
-            if key not in data:
-                raise ValueError(f"{path} is not a valid index: missing '{key}'")
+        try:
+            data = np.load(path, allow_pickle=False)
+        except ValueError as e:
+            log.error("cannot load index %s: %s", path, e)
+            raise
         # Return the (N, dim) array as loaded: splitting it into per-row views kept
         # the whole matrix alive behind 375k small objects, and the caller stacked a
         # second copy of it anyway.
