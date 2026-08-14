@@ -24,6 +24,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+SEARCH_MODES = ("rrf", "embed", "bm25")
+SEARCH_FORMATS = ("text", "json", "markdown")
+MAX_TOP_K = 100
+MAX_DOCUMENTS = 1000
+
+
+class PathNotAllowed(ValueError):
+    pass
+
+
 class EmbedderApp:
     def __init__(
         self, project_name: str, model_name: str = "all-MiniLM-L6-v2",
@@ -56,6 +66,21 @@ class EmbedderApp:
                 self.cross_encoder_error = f"failed to load cross-encoder '{cross_encoder_model}': {e}"
                 log.warning("%s; continuing without reranking", self.cross_encoder_error)
 
+    def _resolve_store_path(self, path: str) -> str:
+        """Resolve a caller-supplied .npz path inside the project's data dir.
+
+        Paths outside the data dir (absolute paths, `..`, symlinks pointing out)
+        are rejected so tool callers cannot read or overwrite arbitrary files.
+        """
+        base = os.path.realpath(self.data_dir)
+        candidate = path if os.path.isabs(path) else os.path.join(base, path)
+        full = os.path.realpath(candidate)
+        if full != base and not full.startswith(base + os.sep):
+            raise PathNotAllowed(f"path must stay inside the project store ({base})")
+        if not full.endswith(".npz"):
+            raise PathNotAllowed("path must point to a .npz file")
+        return full
+
     def _tokenize(self, text: str) -> list[str]:
         words = re.split(r'[^a-zA-Z0-9]+', text)
         result = []
@@ -77,6 +102,7 @@ class EmbedderApp:
         self._bm25 = BM25Okapi(corpus)
 
     def init(self, data_path: str) -> str:
+        data_path = self._resolve_store_path(data_path)
         vecs, texts, dim, node_ids = StorageIO.load(data_path)
         self.store = VectorStore()
         self.store.vectors = vecs
@@ -90,6 +116,7 @@ class EmbedderApp:
         return f"Loaded {len(self.store)} vectors, dim={dim}"
 
     def load_delta(self, data_path: str) -> str:
+        data_path = self._resolve_store_path(data_path)
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"delta file not found: {data_path}")
         vecs, texts, dim, _ = StorageIO.load(data_path)
@@ -121,14 +148,18 @@ class EmbedderApp:
         if not hasattr(self, "_tree_store"):
             tree_vec_path = os.path.join(self.data_dir, "tree_vectors.npz")
             if os.path.exists(tree_vec_path):
-                tvecs, ttexts, _, _ = StorageIO.load(tree_vec_path)
-                self._tree_store = VectorStore()
-                self._tree_store.add_many(tvecs, ttexts)
-                # Build reverse map: tree_uid → flat idx
-                self._tree_to_flat = {}
-                for flat_idx, nid in enumerate(self.store.node_ids):
-                    if nid is not None:
-                        self._tree_to_flat[nid] = flat_idx
+                try:
+                    tvecs, ttexts, _, _ = StorageIO.load(tree_vec_path)
+                    self._tree_store = VectorStore()
+                    self._tree_store.add_many(tvecs, ttexts)
+                    # Build reverse map: tree_uid → flat idx
+                    self._tree_to_flat = {}
+                    for flat_idx, nid in enumerate(self.store.node_ids):
+                        if nid is not None:
+                            self._tree_to_flat[nid] = flat_idx
+                except Exception as e:
+                    self._tree_store = None
+                    log.warning("failed to load tree vectors '%s': %s", tree_vec_path, e)
             else:
                 self._tree_store = None
         return self._tree_store
@@ -321,7 +352,7 @@ class EmbedderApp:
         if mode == "bm25" or alpha <= 0.0:
             return self._bm25_hits(bm25_raw, bm25_top, top_k)
         if alpha >= 1.0:
-            return self.store.search(qv, top_k=top_k)
+            return [{**h, "method": "embed"} for h in self.store.search(qv, top_k=top_k)]
 
         emb_hits = self.store.search(qv, top_k=top_k * 3)
         candidates = set(h["idx"] for h in emb_hits) | set(bm25_top)
@@ -351,6 +382,7 @@ class EmbedderApp:
         ]
 
     def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
+        query, top_k, mode, alpha, fmt = _validate_search_args(query, top_k, mode, alpha, fmt)
         do_rerank = rerank and self.cross_encoder is not None
         # Retrieve a wider pool when reranking so the cross-encoder can promote
         # documents the bi-encoder/BM25 ranked below top_k.
@@ -363,6 +395,10 @@ class EmbedderApp:
         return self.encoder.embed(text).tolist()
 
     def embed_many(self, texts: list[str]) -> list[list[float]]:
+        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+            raise ValueError("texts must be a list of strings")
+        if len(texts) > MAX_DOCUMENTS:
+            raise ValueError(f"at most {MAX_DOCUMENTS} texts per call")
         return self.encoder.embed_many(texts).tolist()
 
     def add_document(self, text: str) -> str:
@@ -371,12 +407,17 @@ class EmbedderApp:
         return f"Added, total vectors: {len(self.store)}"
 
     def add_documents(self, texts: list[str]) -> str:
+        if not isinstance(texts, list) or not all(isinstance(t, str) for t in texts):
+            raise ValueError("texts must be a list of strings")
+        if len(texts) > MAX_DOCUMENTS:
+            raise ValueError(f"at most {MAX_DOCUMENTS} documents per call")
         vecs = self.encoder.embed_many(self.encoder.as_passages(texts))
         self.store.add_many(vecs, texts)
         self._build_bm25()
         return f"Added {len(texts)} docs, total vectors: {len(self.store)}"
 
     def save(self, path: str) -> str:
+        path = self._resolve_store_path(path)
         dim = self.encoder.dim
         StorageIO.save(path, self.store.vectors, self.store.texts, dim)
         return f"Saved {len(self.store)} vectors to {path}"
@@ -389,6 +430,27 @@ class EmbedderApp:
         if self.cross_encoder_error:
             info["cross_encoder_error"] = self.cross_encoder_error
         return json.dumps(info, ensure_ascii=False)
+
+
+def _validate_search_args(query: str, top_k: int, mode: str, alpha: float | None, fmt: str):
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+    try:
+        top_k = int(top_k)
+    except (TypeError, ValueError):
+        raise ValueError("top_k must be an integer")
+    top_k = max(1, min(top_k, MAX_TOP_K))
+    if mode not in SEARCH_MODES:
+        raise ValueError(f"mode must be one of {', '.join(SEARCH_MODES)}")
+    if fmt not in SEARCH_FORMATS:
+        raise ValueError(f"fmt must be one of {', '.join(SEARCH_FORMATS)}")
+    if alpha is not None:
+        try:
+            alpha = float(alpha)
+        except (TypeError, ValueError):
+            raise ValueError("alpha must be a number")
+        alpha = max(0.0, min(alpha, 1.0))
+    return query, top_k, mode, alpha, fmt
 
 
 projects: dict[str, EmbedderApp] = {}
@@ -407,11 +469,14 @@ def _resolve(project: str) -> tuple[EmbedderApp | None, str | None]:
 
 @mcp.tool()
 def search(query: str, project: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
-    """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7). rerank=True uses cross-encoder. Includes AST context."""
+    """Search code. mode=rrf (default, blend embed+bm25), embed, bm25. alpha fine-tunes the blend (default 0.7, clamped to [0,1]). top_k is capped at 100. rerank=True uses cross-encoder. Includes AST context."""
     app, err = _resolve(project)
     if err:
         return err
-    return app.search(query, top_k=top_k, mode=mode, alpha=alpha, fmt=fmt, rerank=rerank)
+    try:
+        return app.search(query, top_k=top_k, mode=mode, alpha=alpha, fmt=fmt, rerank=rerank)
+    except ValueError as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -429,7 +494,10 @@ def embed_many(texts: list[str], project: str) -> str:
     app, err = _resolve(project)
     if err:
         return err
-    return json.dumps(app.embed_many(texts))
+    try:
+        return json.dumps(app.embed_many(texts))
+    except ValueError as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -447,7 +515,10 @@ def init_store(data_path: str, project: str) -> str:
     app, err = _resolve(project)
     if err:
         return err
-    return app.init(data_path)
+    try:
+        return app.init(data_path)
+    except ValueError as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -465,7 +536,10 @@ def add_documents(texts: list[str], project: str) -> str:
     app, err = _resolve(project)
     if err:
         return err
-    return app.add_documents(texts)
+    try:
+        return app.add_documents(texts)
+    except ValueError as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -474,7 +548,10 @@ def save_store(path: str, project: str) -> str:
     app, err = _resolve(project)
     if err:
         return err
-    return app.save(path)
+    try:
+        return app.save(path)
+    except ValueError as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -483,7 +560,10 @@ def load_delta(data_path: str, project: str) -> str:
     app, err = _resolve(project)
     if err:
         return err
-    return app.load_delta(data_path)
+    try:
+        return app.load_delta(data_path)
+    except (ValueError, FileNotFoundError) as e:
+        return f"Error: {e}"
 
 
 @mcp.tool()
@@ -516,14 +596,22 @@ async def main():
     app = projects[project_name]
 
     data_path = os.path.join(data_dir, "enriched_vectors.npz")
+    base_loaded = True
     if os.path.exists(data_path):
-        app.init(data_path)
+        try:
+            app.init(data_path)
+        except Exception as e:
+            base_loaded = False
+            log.error("Error loading index '%s': %s", data_path, e)
     else:
         log.warning("no flat index at %s, serving an empty store", data_path)
 
     delta_path = os.path.join(data_dir, "delta.npz")
-    if os.path.exists(delta_path):
-        app.load_delta(delta_path)
+    if base_loaded and os.path.exists(delta_path):
+        try:
+            app.load_delta(delta_path)
+        except Exception as e:
+            log.error("Error loading delta '%s': %s", delta_path, e)
 
     await mcp.run_stdio_async()
 
