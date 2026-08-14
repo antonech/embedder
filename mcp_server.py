@@ -9,6 +9,11 @@ from common import ModelConfig, project_data_dir, resolve_device
 from embedder import EmbeddingModel, StorageIO, VectorStore
 from tree_search import TreeIndex
 
+# How many candidates per requested result to feed the cross-encoder.
+RERANK_CANDIDATES = 4
+# Cross-encoder forward-pass batch size.
+RERANK_BATCH = 32
+
 
 class EmbedderApp:
     def __init__(
@@ -178,20 +183,22 @@ class EmbedderApp:
     def _rerank(self, query: str, hits: list[dict], top_k: int) -> list[dict]:
         if not hits or self.cross_encoder is None:
             return hits
-        texts = [h["text"] for h in hits]
-        pairs = [[query, t] for t in texts]
+        pairs = [[query, h["text"]] for h in hits]
         import torch
-        inputs = self.cross_encoder_tokenizer(
-            pairs, padding=True, truncation=True, return_tensors="pt"
-        )
         device = self.cross_encoder.device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            logits = self.cross_encoder(**inputs).logits
-        # sigmoid to convert logits to [0, 1] relevance probabilities
-        probs = torch.sigmoid(logits.squeeze(-1)).cpu().numpy().tolist()
-        if isinstance(probs, float):
-            probs = [probs]
+        probs = []
+        for i in range(0, len(pairs), RERANK_BATCH):
+            inputs = self.cross_encoder_tokenizer(
+                pairs[i:i + RERANK_BATCH], padding=True, truncation=True, return_tensors="pt"
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                logits = self.cross_encoder(**inputs).logits
+            # sigmoid to convert logits to [0, 1] relevance probabilities
+            batch_probs = torch.sigmoid(logits.squeeze(-1)).cpu().numpy().tolist()
+            if isinstance(batch_probs, float):
+                batch_probs = [batch_probs]
+            probs.extend(batch_probs)
         for i, h in enumerate(hits):
             h["score"] = round(float(probs[i]), 4)
             h["method"] = "reranked"
@@ -270,12 +277,13 @@ class EmbedderApp:
             for i in top_idxs
         ]
 
-    def _finalize(self, query: str, hits: list[dict], qv, top_k: int, fmt: str, do_rerank: bool) -> str:
+    def _finalize(self, query: str, hits: list[dict], qv, top_k: int, cand_k: int,
+                  fmt: str, do_rerank: bool) -> str:
         """Tree fusion → optional reranking → AST annotation → formatting."""
-        hits = self._fuse_with_tree(hits, qv, top_k=top_k)
+        hits = self._fuse_with_tree(hits, qv, top_k=cand_k)
         if do_rerank:
             hits = self._rerank(query, hits, top_k)
-        return self._format(self._annotate(hits), fmt)
+        return self._format(self._annotate(hits[:top_k]), fmt)
 
     def _candidates(self, query: str, qv, top_k: int, mode: str, alpha: float | None) -> list[dict]:
         if mode == "embed" or self._bm25 is None:
@@ -320,9 +328,12 @@ class EmbedderApp:
 
     def search(self, query: str, top_k: int = 5, mode: str = "rrf", alpha: float | None = None, fmt: str = "text", rerank: bool = True) -> str:
         do_rerank = rerank and self.cross_encoder is not None
+        # Retrieve a wider pool when reranking so the cross-encoder can promote
+        # documents the bi-encoder/BM25 ranked below top_k.
+        cand_k = top_k * RERANK_CANDIDATES if do_rerank else top_k
         qv = self._embed_query(query)
-        hits = self._candidates(query, qv, top_k, mode, alpha)
-        return self._finalize(query, hits, qv, top_k, fmt, do_rerank)
+        hits = self._candidates(query, qv, cand_k, mode, alpha)
+        return self._finalize(query, hits, qv, top_k, cand_k, fmt, do_rerank)
 
     def embed(self, text: str) -> list[float]:
         return self.encoder.embed(text).tolist()
@@ -457,11 +468,12 @@ def clear_delta(project: str) -> str:
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--project", help="Project name (default: basename of workdir)")
+    parser.add_argument("--project", help="Project name (default: basename of --root)")
+    parser.add_argument("--root", default=".", help="Project root directory (default: current directory)")
     args = parser.parse_args()
 
     cfg = ModelConfig.load()
-    project_name = args.project or os.path.basename(os.getcwd())
+    project_name = args.project or os.path.basename(os.path.abspath(args.root))
     data_dir = project_data_dir(project_name)
 
     if project_name not in projects:
