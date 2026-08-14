@@ -6,3 +6,5 @@ install.log
 data/*.npz
 data/tree_index.json
 *.log
+.coverage
+.pytest_cache/
