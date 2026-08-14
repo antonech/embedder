@@ -4,6 +4,7 @@ import pytest
 from tree_sitter import Parser
 
 import common
+from common import iter_tree_index
 import tree_ast_parser as tap
 
 PY_SOURCE = '''
@@ -250,9 +251,9 @@ def test_build_index_writes_tree_artifacts(tmp_path, monkeypatch):
     assert [n["name"] for n in nodes] == ["Service", "create", "helper"]
     assert len(store.texts) == 3
     assert (data_dir / "tree_vectors.npz").exists()
-    saved = json.loads((data_dir / "tree_index.json").read_text())
-    assert len(saved["nodes"]) == 3
-    assert saved["texts"] == store.texts
+    saved = list(iter_tree_index(str(data_dir / "tree_index.json")))
+    assert len(saved) == 3
+    assert [text for _node, text in saved] == store.texts
 
 
 def test_build_index_skips_unparseable_files(tmp_path, monkeypatch, capsys, caplog):
@@ -297,8 +298,8 @@ def test_build_delta_writes_delta_artifacts(tmp_path, monkeypatch):
     tap.build_delta(root=str(project), data_dir=str(data_dir))
 
     assert (data_dir / "delta_tree_vectors.npz").exists()
-    saved = json.loads((data_dir / "delta_tree_index.json").read_text())
-    assert [n["name"] for n in saved["nodes"]] == ["Service", "create", "helper"]
+    saved = list(iter_tree_index(str(data_dir / "delta_tree_index.json")))
+    assert [n["name"] for n, _text in saved] == ["Service", "create", "helper"]
 
 
 def test_build_delta_raises_when_every_file_fails(tmp_path, monkeypatch):
@@ -336,5 +337,5 @@ def test_build_delta_skips_failing_file(tmp_path, monkeypatch, capsys):
     tap.build_delta(root=str(project), data_dir=str(data_dir))
 
     assert "WARNING: skipped 1/2 changed files" in capsys.readouterr().out
-    names = [n["name"] for n in json.loads((data_dir / "delta_tree_index.json").read_text())["nodes"]]
+    names = [n["name"] for n, _text in iter_tree_index(str(data_dir / "delta_tree_index.json"))]
     assert names == ["f"]

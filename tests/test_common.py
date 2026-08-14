@@ -39,6 +39,74 @@ def test_load_project_config_ignores_foreign_files(tmp_path, caplog):
     assert common.load_project_config(str(ours)) == {"model_name": "m", "port": 3000}
 
 
+def _tree_nodes():
+    return [
+        {"id": 0, "parent_id": -1, "type": "class_definition", "name": "Service",
+         "file": "svc.py", "start_line": 1, "end_line": 9, "text": "Class svc.py Service"},
+        {"id": 1, "parent_id": 0, "type": "function_definition", "name": "create",
+         "file": "svc.py", "start_line": 2, "end_line": 4, "text": "Function svc.py create"},
+    ]
+
+
+def test_tree_index_roundtrip_is_json_lines(tmp_path):
+    nodes = _tree_nodes()
+    path = tmp_path / "tree_index.json"
+    common.write_tree_index(str(path), nodes, [n["text"] for n in nodes])
+
+    lines = path.read_text().splitlines()
+    assert json.loads(lines[0]) == {"format": common.TREE_INDEX_FORMAT, "count": 2}
+    assert len(lines) == 3
+    assert list(common.iter_tree_index(str(path))) == [(n, n["text"]) for n in nodes]
+
+
+def test_tree_index_stores_includes_once_per_file(tmp_path):
+    nodes = [dict(n, includes=["vector", "local.h"]) for n in _tree_nodes()]
+    path = tmp_path / "tree_index.json"
+    common.write_tree_index(str(path), nodes, [])
+
+    header = json.loads(path.read_text().splitlines()[0])
+    assert header["includes"] == {"svc.py": ["vector", "local.h"]}
+    assert "includes" not in json.loads(path.read_text().splitlines()[1])
+
+    # the reader hands the same list object back to every node of that file
+    read = [n for n, _t in common.iter_tree_index(str(path))]
+    assert [n["includes"] for n in read] == [["vector", "local.h"]] * 2
+    assert read[0]["includes"] is read[1]["includes"]
+
+
+def test_write_tree_index_takes_text_from_texts_when_node_has_none(tmp_path):
+    nodes = [{k: v for k, v in n.items() if k != "text"} for n in _tree_nodes()]
+    path = tmp_path / "tree_index.json"
+    common.write_tree_index(str(path), nodes, ["first", "second"])
+    assert [text for _n, text in common.iter_tree_index(str(path))] == ["first", "second"]
+
+
+@pytest.mark.parametrize("indent", [None, 2])
+def test_iter_tree_index_reads_pre_jsonl_files(tmp_path, indent):
+    """Indices written before the JSON-Lines format must keep loading."""
+    nodes = _tree_nodes()
+    path = tmp_path / "tree_index.json"
+    path.write_text(json.dumps({"nodes": nodes, "texts": ["a", "b"]}, indent=indent))
+    assert [(n["name"], t) for n, t in common.iter_tree_index(str(path))] == [
+        ("Service", "Class svc.py Service"), ("create", "Function svc.py create")]
+
+    # a legacy file whose nodes carry no text falls back to the parallel texts list
+    bare = [{k: v for k, v in n.items() if k != "text"} for n in nodes]
+    path.write_text(json.dumps({"nodes": bare, "texts": ["a", "b"]}, indent=indent))
+    assert [t for _n, t in common.iter_tree_index(str(path))] == ["a", "b"]
+
+
+def test_iter_tree_index_reports_broken_and_incomplete_files(tmp_path):
+    path = tmp_path / "tree_index.json"
+    path.write_text("{not json")
+    with pytest.raises(RuntimeError, match="cannot read tree index"):
+        list(common.iter_tree_index(str(path)))
+
+    path.write_text(json.dumps({"texts": []}))
+    with pytest.raises(RuntimeError, match="is missing 'nodes'"):
+        list(common.iter_tree_index(str(path)))
+
+
 def test_load_labels_falls_back_to_defaults(monkeypatch, tmp_path):
     monkeypatch.setattr(common, "LABELS_PATH", str(tmp_path / "labels.json"))
     assert common.load_labels() == common.DEFAULT_LABELS

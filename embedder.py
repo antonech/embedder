@@ -10,7 +10,7 @@ from common import (
     SKIP_DIRS as _SKIP_DIRS, SKIP_PREFIXES as _SKIP_PREFIXES,
     add_tree_context, changed_files, enrich_chunks, label_for,
     load_project_config, node_text, resolve_data_dir, ts_base_classes,
-    ts_body_summary, ts_declarator_name,
+    ts_body_summary, ts_declarator_name, write_tree_index,
 )
 
 log = logging.getLogger(__name__)
@@ -771,41 +771,72 @@ class EmbeddingModel:
                    float_type=cfg.float_type)
 
 
+_EMPTY_MATRIX = np.empty((0, 0), dtype=np.float32)
+
+
+def _as_matrix(vecs) -> np.ndarray:
+    """Coerce vectors (2-D array, single row, or sequence of rows) to one (N, dim) array."""
+    if not isinstance(vecs, np.ndarray):
+        vecs = np.stack(vecs) if len(vecs) else _EMPTY_MATRIX
+    if vecs.ndim == 1:
+        return vecs.reshape(1, -1) if vecs.size else _EMPTY_MATRIX
+    return vecs if vecs.size else _EMPTY_MATRIX
+
+
 class VectorStore:
-    """In-memory vector store with cosine similarity search."""
+    """In-memory vector store with cosine similarity search.
+
+    Vectors live in one (N, dim) matrix rather than a list of per-row arrays with
+    a stacked cache beside it: that layout held the same data twice, so a 375k
+    chunk index needed ~1.9 GB resident for a 549 MiB matrix. Appends collect in
+    `_pending` and are concatenated on the next read.
+    """
 
     def __init__(self):
-        self.vectors: list[np.ndarray] = []
-        self._array_cache: np.ndarray | None = None
-        self._cached_len = 0
+        self._matrix: np.ndarray = _EMPTY_MATRIX
+        self._pending: list[np.ndarray] = []
         self.texts: list[str] = []
         self.node_ids: list[int | None] = []
 
+    @property
+    def vectors(self) -> np.ndarray:
+        """Every vector as a single (N, dim) array."""
+        return self._get_array()
+
+    @vectors.setter
+    def vectors(self, value) -> None:
+        self._matrix = _as_matrix(value)
+        self._pending = []
+
+    @property
+    def dim(self) -> int:
+        source = self._matrix if len(self._matrix) else next(iter(self._pending), _EMPTY_MATRIX)
+        return int(source.shape[1]) if len(source) else 0
+
     def _get_array(self) -> np.ndarray:
-        if len(self.vectors) != self._cached_len or self._array_cache is None:
-            self._array_cache = np.stack(self.vectors) if self.vectors else np.array([])
-            self._cached_len = len(self.vectors)
-        return self._array_cache
+        if self._pending:
+            parts = ([self._matrix] if len(self._matrix) else []) + self._pending
+            self._matrix = parts[0] if len(parts) == 1 else np.concatenate(parts)
+            self._pending = []
+        return self._matrix
 
     def add(self, vec: np.ndarray, text: str, node_id: int | None = None) -> None:
-        self.vectors.append(vec)
+        self._pending.append(_as_matrix(vec))
         self.texts.append(text)
         self.node_ids.append(node_id)
-        self._array_cache = None
-
-    def invalidate_cache(self) -> None:
-        """Drop the stacked-vector cache after `vectors` is mutated directly."""
-        self._array_cache = None
-        self._cached_len = 0
 
     def add_many(self, vecs: np.ndarray, texts: list[str], node_ids: list[int | None] | None = None) -> None:
-        self.vectors.extend(vecs)
+        block = _as_matrix(vecs)
+        if len(block):
+            self._pending.append(block)
         self.texts.extend(texts)
-        if node_ids is not None:
-            self.node_ids.extend(node_ids)
-        else:
-            self.node_ids.extend([None] * len(texts))
-        self._array_cache = None
+        self.node_ids.extend(node_ids if node_ids is not None else [None] * len(texts))
+
+    def truncate(self, size: int) -> None:
+        """Keep the first `size` entries, dropping the tail (used to clear a delta)."""
+        self._matrix = self._get_array()[:size]
+        self.texts = self.texts[:size]
+        self.node_ids = self.node_ids[:size]
 
     def search(self, query_vec: np.ndarray, top_k: int = 5) -> list[dict]:
         array = self._get_array()
@@ -821,7 +852,7 @@ class VectorStore:
         ]
 
     def __len__(self) -> int:
-        return len(self.vectors)
+        return len(self._matrix) + sum(len(block) for block in self._pending)
 
 
 class StorageIO:
@@ -863,8 +894,10 @@ class StorageIO:
         for key in ("vectors", "dim"):
             if key not in data:
                 raise ValueError(f"{path} is not a valid index: missing '{key}'")
-        vecs = data["vectors"]
-        vectors = [vecs[i] for i in range(len(vecs))]
+        # Return the (N, dim) array as loaded: splitting it into per-row views kept
+        # the whole matrix alive behind 375k small objects, and the caller stacked a
+        # second copy of it anyway.
+        vectors = data["vectors"]
         if "texts_blob" in data:
             blob = data["texts_blob"].tobytes()
             offsets = data["texts_offsets"]
@@ -1117,9 +1150,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         tree_vec_path = os.path.join(data_dir, "tree_vectors.npz")
         if tree_vecs.size and enc_tree is not None:
             StorageIO.save(tree_vec_path, tree_vecs, tree_texts, enc_tree.dim)
-            tree_data = {"nodes": all_tree_nodes, "texts": tree_texts}
-            with open(tree_json_path, "w", encoding="utf8") as f:
-                json.dump(tree_data, f, ensure_ascii=False)
+            write_tree_index(tree_json_path, all_tree_nodes, tree_texts)
             print(f"Tree index: {len(all_tree_nodes)} nodes -> {tree_vec_path} + {tree_json_path}", flush=True)
         else:
             print("No tree nodes found")

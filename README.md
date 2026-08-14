@@ -141,6 +141,23 @@ Usage: `search("query", rerank=True)` — defaults to auto (enabled if model loa
 object array, and it loads without pickle. Older indices that stored a pickled `texts` array are
 still read as they are.
 
+`tree_index.json` is JSON Lines: a header (`{"format": "tree-jsonl", "count": N, "includes": {…}}`)
+followed by one node per line. The reader streams it, so only one node is in memory at a time, and
+per-file `#include` lists live in the header instead of being copied onto every node of that file.
+Indices written before this layout — a single JSON object with `nodes` and a parallel `texts` array —
+are still read, but whole-file parsing costs several times the memory. Rebuild to get the new one:
+
+| clickhouse tree index (102,651 nodes) | old | new |
+|---|---|---|
+| file size | 105 MB | 32 MB |
+| resident after load | 273 MB | 80 MB |
+| peak while loading | 457 MB | 80 MB |
+| load time | 1.34 s | 0.62 s |
+
+Vectors are held as a single `(N, dim)` matrix rather than a list of rows plus a stacked copy of the
+same data; on that index the flat store went from ~1.9 GB to ~1.25 GB resident, and a full server
+(model + flat index + tree index + BM25) from 3.2 GB to 2.4 GB.
+
 ## Enrichment strategies
 
 Configured in `config.json` under `"enrichment"` key (array of strategy names).

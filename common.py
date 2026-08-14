@@ -68,6 +68,79 @@ def load_project_config(path: str) -> dict:
     return cfg
 
 
+TREE_INDEX_FORMAT = "tree-jsonl"
+
+
+def write_tree_index(path: str, nodes: list[dict], texts: list[str]) -> None:
+    """Write a tree index as JSON Lines: a header line, then one node per line.
+
+    The previous layout was a single (sometimes pretty-printed) JSON object that
+    stored every chunk text twice — once in `nodes[i]["text"]` and again in
+    `texts[i]` — and repeated the file's whole include list on every node of that
+    file. For a 100k-node index that was 105 MB on disk (45 MB of it duplicated
+    include lists) and ~450 MB to parse, because the entire node array had to
+    exist as dicts at once. Here each node is one line, includes are stored once
+    per file in the header, and the reader can stream. Readers still accept the
+    old layout.
+    """
+    includes = {}
+    for node in nodes:
+        if node.get("includes"):
+            includes.setdefault(node.get("file", ""), node["includes"])
+    with open(path, "w", encoding="utf8") as f:
+        header = {"format": TREE_INDEX_FORMAT, "count": len(nodes)}
+        if includes:
+            header["includes"] = includes
+        f.write(json.dumps(header, ensure_ascii=False) + "\n")
+        for i, node in enumerate(nodes):
+            if "includes" in node:
+                node = {k: v for k, v in node.items() if k != "includes"}
+            if "text" not in node and i < len(texts):
+                node = {**node, "text": texts[i]}
+            f.write(json.dumps(node, ensure_ascii=False) + "\n")
+
+
+def iter_tree_index(path: str):
+    """Yield (node dict, chunk text) for every node in a tree index.
+
+    The JSON-Lines format is streamed, so only one node dict is alive at a time.
+    Files written before it are a single JSON object and must be parsed whole.
+    """
+    try:
+        with open(path) as f:
+            first_line = f.readline()
+            try:
+                head = json.loads(first_line)
+            except ValueError:
+                head = None  # pretty-printed legacy file: parse the whole thing
+            if isinstance(head, dict) and head.get("format") == TREE_INDEX_FORMAT:
+                # One shared list per file, not a fresh copy per node.
+                includes = head.get("includes") or {}
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        node = json.loads(line)
+                        shared = includes.get(node.get("file", ""))
+                        if shared is not None:
+                            node["includes"] = shared
+                        yield node, node.get("text", "")
+                return
+            if isinstance(head, dict) and "nodes" in head:
+                data = head  # legacy file written on a single line
+            else:
+                f.seek(0)
+                data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"cannot read tree index {path}: {e}") from e
+
+    for key in ("nodes", "texts"):
+        if key not in data:
+            raise RuntimeError(f"tree index {path} is missing '{key}'")
+    texts = data["texts"]
+    for i, node in enumerate(data["nodes"]):
+        yield node, node.get("text", texts[i] if i < len(texts) else "")
+
+
 def load_labels() -> dict:
     labels = load_json(LABELS_PATH)
     return labels or DEFAULT_LABELS

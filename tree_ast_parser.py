@@ -1,11 +1,11 @@
-import os, json, logging, sys
+import os, logging, sys
 
 from tree_sitter import Language, Parser
 import tree_sitter_python, tree_sitter_cpp, tree_sitter_bash
 from embedder import EmbeddingModel, VectorStore, StorageIO, ASTParser
 from common import (
     DEFAULT_EXCLUDE, changed_files, label_for, node_text, resolve_data_dir,
-    ts_base_classes, ts_body_summary, ts_template_params,
+    ts_base_classes, ts_body_summary, ts_template_params, write_tree_index,
 )
 
 log = logging.getLogger(__name__)
@@ -202,8 +202,7 @@ def _save_tree_index(data_dir: str, model, store, all_nodes: list, vec_name: str
     vec_path = os.path.join(data_dir, vec_name)
     json_path = os.path.join(data_dir, json_name)
     StorageIO.save(vec_path, store.vectors, store.texts, model.dim)
-    with open(json_path, "w", encoding="utf8") as f:
-        json.dump({"nodes": all_nodes, "texts": store.texts}, f, ensure_ascii=False, indent=2)
+    write_tree_index(json_path, all_nodes, store.texts)
     return vec_path, json_path
 
 
