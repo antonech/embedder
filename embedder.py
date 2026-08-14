@@ -745,7 +745,13 @@ class VectorStore:
 
 
 class StorageIO:
-    """Save/load vectors, texts, node_ids and dimension to/from .npz files."""
+    """Save/load vectors, texts, node_ids and dimension to/from .npz files.
+
+    Texts are stored as a length-prefixed UTF-8 blob so indices can be read
+    back without numpy's pickle-based object deserialization.
+    """
+
+    ALLOW_PICKLE_ENV = "EMBEDDER_ALLOW_PICKLE"
 
     @staticmethod
     def save(path: str, vectors: np.ndarray | list[np.ndarray], texts: list[str], dim: int,
@@ -754,10 +760,17 @@ class StorageIO:
             vecs_array = np.stack(vectors) if vectors else np.array([])
         else:
             vecs_array = np.asarray(vectors)
+        offsets = np.empty(len(texts) + 1, dtype=np.int64)
+        offsets[0] = 0
+        blob = bytearray()
+        for i, text in enumerate(texts):
+            blob.extend(text.encode("utf-8"))
+            offsets[i + 1] = len(blob)
         data = {
             "dim": np.array(dim),
             "vectors": vecs_array,
-            "texts": np.array(texts, dtype=object),
+            "texts_blob": np.frombuffer(blob, dtype=np.uint8),
+            "texts_offsets": offsets,
         }
         if node_ids is not None:
             data["node_ids"] = np.array(
@@ -766,12 +779,31 @@ class StorageIO:
         np.savez_compressed(path, **data)
 
     @staticmethod
+    def _load_legacy_texts(path: str) -> list[str]:
+        if os.environ.get(StorageIO.ALLOW_PICKLE_ENV) != "1":
+            raise ValueError(
+                f"{path} was written in the legacy pickled format. Loading it executes "
+                f"arbitrary code from the file. Rebuild the index (./rebuild_index.sh) or, "
+                f"if the file is trusted, set {StorageIO.ALLOW_PICKLE_ENV}=1."
+            )
+        legacy = np.load(path, allow_pickle=True)
+        return [str(t) for t in legacy["texts"]]
+
+    @staticmethod
     def load(path: str) -> tuple:
         """Load vectors, texts, node_ids and dimension from a .npz file."""
-        data = np.load(path, allow_pickle=True)
+        data = np.load(path, allow_pickle=False)
         vecs = data["vectors"]
         vectors = [vecs[i] for i in range(len(vecs))]
-        texts = list(data["texts"])
+        if "texts_blob" in data:
+            blob = data["texts_blob"].tobytes()
+            offsets = data["texts_offsets"]
+            texts = [
+                blob[offsets[i]:offsets[i + 1]].decode("utf-8")
+                for i in range(len(offsets) - 1)
+            ]
+        else:
+            texts = StorageIO._load_legacy_texts(path)
         dim = int(data["dim"])
         node_ids = None
         if "node_ids" in data:

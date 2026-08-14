@@ -122,6 +122,15 @@ probabilities [0, 1] before truncating to `top_k`. Adds ~2ms per candidate on GP
 
 Usage: `search("query", rerank=True)` — defaults to auto (enabled if model loaded).
 
+## Security notes
+
+- Index files (`*.npz`) store chunk texts as a length-prefixed UTF-8 blob, so loading
+  them never runs numpy's pickle deserializer. Indices built before this change are
+  rejected with a message to rebuild; set `EMBEDDER_ALLOW_PICKLE=1` to load a legacy
+  file you trust.
+- MCP tools that take a path (`init_store`, `load_delta`, `save_store`) only accept
+  `.npz` paths inside the project's store directory.
+
 ## Enrichment strategies
 
 Configured in `config.json` under `"enrichment"` key (array of strategy names).
