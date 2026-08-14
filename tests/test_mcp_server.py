@@ -138,6 +138,54 @@ def test_init_resets_cached_tree(app, tree_dir, store_path):
     assert not hasattr(app, "_tree")
 
 
+def test_init_invalidates_tree_vectors_and_flat_map(app, tree_dir, store_path, fake_encoder):
+    """A reloaded store must not keep the previous tree->flat map.
+
+    The map is keyed by flat index, so a stale entry would boost whatever chunk
+    now happens to sit at that index.
+    """
+    app.init(str(store_path))
+    assert app._get_tree_store() is not None
+    assert app._tree_to_flat == {0: 0, 1: 1}
+
+    other = tree_dir / "other.npz"
+    enc = FakeEncoder()
+    texts = ["Function other.py unrelated | nothing to do with Service"]
+    StorageIO.save(str(other), enc.embed_many(texts), texts, enc.dim, node_ids=[None])
+    app.init(str(other))
+
+    assert not hasattr(app, "_tree_store")
+    assert not hasattr(app, "_tree_to_flat")
+    app._get_tree_store()
+    assert app._tree_to_flat == {}
+
+
+def test_loads_index_from_another_directory(app, store_path, tmp_path, fake_encoder):
+    """Any readable .npz is fair game, including another project's index."""
+    other = tmp_path / "elsewhere" / "enriched_vectors.npz"
+    other.parent.mkdir()
+    enc = FakeEncoder()
+    texts = ["Function other.py sibling_fn | from another project"]
+    StorageIO.save(str(other), enc.embed_many(texts), texts, enc.dim)
+
+    app.init(str(store_path))
+    assert app.init(str(other)).startswith("Loaded")
+    assert app.store.texts == texts
+    # data_dir follows the loaded index so its tree files resolve alongside it.
+    assert app.data_dir == str(tmp_path / "elsewhere")
+
+
+def test_bare_filename_means_the_served_directory(app, store_path):
+    app.init(str(store_path))
+    assert app.init("enriched_vectors.npz").startswith("Loaded")
+
+
+def test_missing_index_reports_an_error_instead_of_raising(monkeypatch, app, tmp_path):
+    monkeypatch.setattr(mcp_server, "projects", {"proj": app})
+    out = _fn(mcp_server.init_store)(str(tmp_path / "nope.npz"), "proj")
+    assert out.startswith("Error: ")
+
+
 def test_build_bm25_noop_on_empty_store(app):
     app._build_bm25()
     assert app._bm25 is None
@@ -369,6 +417,19 @@ def test_add_document_and_documents(app):
     assert app.store.texts[-2:] == ["four", "five"]
 
 
+def test_add_defers_bm25_rebuild_until_search(app, store_path):
+    app.init(str(store_path))
+    app.add_document("Function extra.py brand_new_helper | freshly added")
+    app.add_documents(["Function extra.py second_helper | also new"])
+    assert app._bm25_dirty
+
+    hits = json.loads(app.search("brand new helper", top_k=3, mode="bm25", fmt="json"))
+    assert not app._bm25_dirty
+    # The deferred rebuild must cover the added docs, not just the loaded index.
+    assert len(app._bm25.idf) > 0
+    assert any("brand_new_helper" in h["text"] for h in hits)
+
+
 def test_save_and_info(app, tmp_path):
     app.add_documents(["one", "two"])
     path = tmp_path / "out.npz"
@@ -378,6 +439,14 @@ def test_save_and_info(app, tmp_path):
 
     info = json.loads(app.info())
     assert info == {"vectors": 2, "delta": 0, "sample_texts": ["one", "two"]}
+
+
+def test_save_roundtrips_node_ids(app, store_path, tmp_path):
+    app.init(str(store_path))
+    path = tmp_path / "resaved.npz"
+    app.save(str(path))
+    assert app.init(str(path)).startswith("Loaded")
+    assert app.store.node_ids == [0, 1, None, None]
 
 
 def test_info_on_empty_store(app):
@@ -426,6 +495,9 @@ def test_tools_delegate_to_app(monkeypatch, app, store_path, tmp_path):
     assert _fn(mcp_server.add_document)("new doc", "proj").startswith("Added,")
     assert _fn(mcp_server.add_documents)(["a", "b"], "proj").startswith("Added 2 docs")
     assert _fn(mcp_server.save_store)(str(tmp_path / "saved.npz"), "proj").startswith("Saved")
-    with pytest.raises(FileNotFoundError):
-        _fn(mcp_server.load_delta)(str(tmp_path / "missing.npz"), "proj")
+    # Tools report failures as strings rather than raising, so the MCP layer keeps
+    # returning a well-formed result instead of surfacing a traceback.
+    assert _fn(mcp_server.load_delta)(str(tmp_path / "missing.npz"), "proj").startswith(
+        "Error: delta file not found"
+    )
     assert _fn(mcp_server.clear_delta)("proj") == "No delta to clear"

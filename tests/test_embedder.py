@@ -1,5 +1,4 @@
 import json
-import os
 
 import numpy as np
 import pytest
@@ -10,12 +9,15 @@ from embedder import (
     ASTParser,
     BodyStrategy,
     CompositeStrategy,
+    ContentStrategy,
     DocstringStrategy,
     EmbeddingModel,
     KindStrategy,
     NameStrategy,
     SignatureStrategy,
+    StatementsStrategy,
     StorageIO,
+    StructureStrategy,
     VectorStore,
 )
 
@@ -57,22 +59,53 @@ def test_docstring_strategy_falls_back_to_doc_key():
     assert DocstringStrategy().enrich({}) == ""
 
 
-def test_body_strategy_summarizes_all_sections():
-    node = {
-        "in_class": "Service",
-        "methods": ["create", "delete", " "],
-        "fields": ["width", ""],
-        "bases": ["Base"],
-        "body": ["line1", "  ", "line2"],
-    }
-    out = BodyStrategy().enrich(node)
+FULL_NODE = {
+    "in_class": "Service",
+    "methods": ["create", "delete", " "],
+    "fields": ["width", ""],
+    "bases": ["Base"],
+    "body": ["line1", "  ", "line2"],
+}
+
+
+def test_structure_strategy_summarizes_shape_only():
+    out = StructureStrategy().enrich(FULL_NODE)
+    assert out == "In class: Service | Methods: create, delete | Fields: width | Inherits: Base"
+    assert StructureStrategy().enrich({}) == ""
+    assert StructureStrategy.key() == "structure"
+
+
+def test_content_strategy_handles_string_bodies_only():
+    assert ContentStrategy().enrich({"body": "x" * 300}) == "x" * 200
+    assert ContentStrategy().enrich({"body": "   "}) == ""
+    assert ContentStrategy().enrich({"body": ["a", "b"]}) == ""
+    assert ContentStrategy().enrich({}) == ""
+    assert ContentStrategy.key() == "content"
+
+
+def test_statements_strategy_handles_list_bodies_only():
+    assert StatementsStrategy().enrich(FULL_NODE) == "line1 | line2"
+    assert StatementsStrategy().enrich({"body": "a string"}) == ""
+    assert StatementsStrategy().enrich({}) == ""
+    parts = StatementsStrategy().enrich(
+        {"body": [f"line{i}" for i in range(10)]}).split(" | ")
+    assert parts == [f"line{i}" for i in range(StatementsStrategy.MAX_LINES)]
+
+
+def test_default_enrichment_excludes_statements():
+    assert "statements" not in embedder.DEFAULT_ENRICHMENT
+    out = CompositeStrategy.from_keys(embedder.DEFAULT_ENRICHMENT).enrich({
+        "name": "run", "args": ["x"], "docstring": "Runs it.",
+        "in_class": "Service", "body": ["secret = compute()"],
+    })
+    assert out == "(x) | In class: Service | Runs it."
+    assert "secret" not in out
+
+
+def test_body_strategy_is_legacy_alias_for_all_three():
+    out = BodyStrategy().enrich(FULL_NODE)
     assert out == "In class: Service | Methods: create, delete | Fields: width | Inherits: Base | line1 | line2"
-
-
-def test_body_strategy_truncates_body_lines():
-    node = {"body": [f"line{i}" for i in range(10)]}
-    parts = BodyStrategy().enrich(node).split(" | ")
-    assert parts == [f"line{i}" for i in range(BodyStrategy.MAX_LINES)]
+    assert BodyStrategy.key() == "body"
 
 
 def test_body_strategy_with_string_body():
@@ -119,7 +152,7 @@ async def fetch(url):
 def test_parse_python_classes_and_functions():
     chunks = ASTParser._parse_python(PY_SOURCE, "svc.py")
     by_name = {c["name"]: c for c in chunks}
-    assert set(by_name) == {"Service", "fetch"}  # methods are folded into the class
+    assert set(by_name) == {"Service", "create", "fetch"}
     svc = by_name["Service"]
     assert svc["kind"] == "Class"
     assert svc["file"] == "svc.py"
@@ -129,7 +162,29 @@ def test_parse_python_classes_and_functions():
     fetch = by_name["fetch"]
     assert fetch["kind"] == "Function"
     assert fetch["args"] == ["url"]
-    assert fetch["body"] == ["'Fetch.'", "x = 1"]
+    assert fetch["in_class"] == ""
+    # The docstring is not a body statement: it would duplicate DocstringStrategy.
+    assert fetch["body"] == ["x = 1", "return x"]
+
+
+def test_parse_python_indexes_methods_with_owning_class():
+    """Methods need their own chunk; a name in the class's Methods: list is not findable."""
+    by_name = {c["name"]: c for c in ASTParser._parse_python(PY_SOURCE, "svc.py")}
+    create = by_name["create"]
+    assert create["kind"] == "Method"
+    assert create["in_class"] == "Service"
+    assert create["args"] == ["self", "name"]
+    assert create["docstring"] == "Create."
+    assert create["body"] == ["return name"]
+
+
+def test_python_body_lines_without_docstring():
+    import ast
+
+    fn = ast.parse("def f():\n    a = 1\n    b = 2\n    c = 3\n").body[0]
+    assert ASTParser._python_body_lines(fn) == ["a = 1", "b = 2"]
+    doc_only = ast.parse("def f():\n    'just a doc'\n").body[0]
+    assert ASTParser._python_body_lines(doc_only) == []
 
 
 def test_parse_python_syntax_error():
@@ -173,7 +228,7 @@ def test_parse_file_reads_and_dispatches(tmp_path):
     path = tmp_path / "svc.py"
     path.write_text(PY_SOURCE)
     chunks = ASTParser.parse_file(str(path), path_hint="svc.py")
-    assert {c["name"] for c in chunks} == {"Service", "fetch"}
+    assert {c["name"] for c in chunks} == {"Service", "create", "fetch"}
 
 
 def test_parse_file_missing_file_returns_empty(tmp_path):
@@ -347,9 +402,51 @@ def test_parse_cpp_empty_source_uses_fallback(monkeypatch):
 
 
 def test_parse_cpp_clang_without_clang(monkeypatch):
+    """Returns nothing so _parse_cpp can pick a better fallback than raw lines."""
     monkeypatch.setattr(embedder, "_CLANG_AVAILABLE", False)
-    chunks = ASTParser._parse_cpp_clang(CPP_SOURCE, "w.cpp")
-    assert all(c["kind"] == "Block" for c in chunks)
+    assert ASTParser._parse_cpp_clang(CPP_SOURCE, "w.cpp") == []
+
+
+def test_parse_cpp_degrades_to_treesitter_not_line_blocks(monkeypatch):
+    """Clang needs real compile flags; failing it must not dump raw source lines."""
+    monkeypatch.setattr(ASTParser, "_use_clang", True)
+    monkeypatch.setattr(embedder, "_CLANG_AVAILABLE", True)
+    monkeypatch.setattr(ASTParser, "_parse_cpp_clang", classmethod(lambda cls, s, p="": []))
+
+    chunks = ASTParser._parse_cpp(CPP_SOURCE, "w.cpp")
+    by_name = {c["name"]: c for c in chunks if isinstance(c, dict)}
+    assert "Widget" in by_name and "add" in by_name
+    assert not any(c.get("kind") == "Block" for c in chunks if isinstance(c, dict))
+
+
+OUT_OF_LINE_CPP = """
+struct HashMap {
+    int find(int key);
+};
+int HashMap::find(int key) {
+    int idx = hash(key) & mask_;
+    return slots_[idx].value;
+}
+void Outer::Inner::run() {}
+"""
+
+
+def test_parse_cpp_indexes_out_of_line_definitions(monkeypatch):
+    """int HashMap::find(...) names itself through a qualified_identifier."""
+    monkeypatch.setattr(ASTParser, "_use_clang", False)
+    chunks = [c for c in ASTParser._parse_cpp(OUT_OF_LINE_CPP, "m.cpp") if isinstance(c, dict)]
+    by_name = {c["name"]: c for c in chunks}
+
+    assert by_name["find"]["in_class"] == "HashMap"
+    assert by_name["find"]["signature"] == "(int key)"
+    assert by_name["run"]["in_class"] == "Inner"
+
+
+def test_parse_cpp_skips_locals_inside_function_bodies(monkeypatch):
+    """`int idx = ...` is a local, not API surface -- indexing it is noise."""
+    monkeypatch.setattr(ASTParser, "_use_clang", False)
+    chunks = [c for c in ASTParser._parse_cpp(OUT_OF_LINE_CPP, "m.cpp") if isinstance(c, dict)]
+    assert "idx" not in {c["name"] for c in chunks}
 
 
 # --- EmbeddingModel ---
@@ -489,7 +586,7 @@ def test_build_flat_index_full(tmp_path, fake_st, capsys):
     (project / "svc.py").write_text(PY_SOURCE)
     _write_config(project / "config.json")
 
-    embedder.build_flat_index(str(project), data_dir="out")
+    embedder.build_flat_index(str(project), data_dir=str(project / "out"))
     ASTParser._use_clang = False
 
     out = project / "out" / "enriched_vectors.npz"
@@ -515,12 +612,9 @@ def test_build_flat_index_enriches_with_tree_context(tmp_path, fake_st):
     ]
     (data_dir / "tree_index.json").write_text(json.dumps({"nodes": nodes, "texts": []}))
 
-    cwd = os.getcwd()
-    os.chdir(project)
     try:
-        embedder.build_flat_index(str(project), data_dir="out")
+        embedder.build_flat_index(str(project), data_dir=str(data_dir))
     finally:
-        os.chdir(cwd)
         ASTParser._use_clang = False
 
     _, texts, _, node_ids = StorageIO.load(str(data_dir / "enriched_vectors.npz"))
@@ -537,11 +631,9 @@ def test_build_flat_index_delta(tmp_path, fake_st, monkeypatch):
     (project / "out").mkdir()
 
     monkeypatch.setattr(embedder, "changed_files", lambda _root: ["svc.py", "missing.py"])
-    cwd = os.getcwd()
     try:
-        embedder.build_flat_index(str(project), data_dir="out", delta=True)
+        embedder.build_flat_index(str(project), data_dir=str(project / "out"), delta=True)
     finally:
-        os.chdir(cwd)
         ASTParser._use_clang = False
 
     delta = json.loads((project / "out" / "delta_texts.json").read_text())
@@ -554,14 +646,12 @@ def test_build_flat_index_delta_no_changes(tmp_path, fake_st, monkeypatch, capsy
     project = tmp_path / "proj"
     project.mkdir()
     _write_config(project / "config.json")
-    (project / "out").mkdir()
 
     monkeypatch.setattr(embedder, "changed_files", lambda _root: [])
-    cwd = os.getcwd()
     try:
-        embedder.build_flat_index(str(project), data_dir="out", delta=True)
+        # data_dir deliberately not pre-created: the empty-delta path must create it.
+        embedder.build_flat_index(str(project), data_dir=str(project / "out"), delta=True)
     finally:
-        os.chdir(cwd)
         ASTParser._use_clang = False
 
     assert "no changed files" in capsys.readouterr().out
@@ -577,11 +667,9 @@ def test_build_flat_index_delta_without_parseable_chunks(tmp_path, fake_st, monk
     (project / "out").mkdir()
 
     monkeypatch.setattr(embedder, "changed_files", lambda _root: ["empty.py"])
-    cwd = os.getcwd()
     try:
-        embedder.build_flat_index(str(project), data_dir="out", delta=True)
+        embedder.build_flat_index(str(project), data_dir=str(project / "out"), delta=True)
     finally:
-        os.chdir(cwd)
         ASTParser._use_clang = False
 
     assert "no parseable chunks" in capsys.readouterr().out
@@ -602,8 +690,27 @@ def test_build_flat_index_resolves_data_dir_from_embedder_config(tmp_path, fake_
     embedder.build_flat_index(str(project))
     ASTParser._use_clang = False
 
-    assert (project / store_root.relative_to("/") / "proj" / "enriched_vectors.npz").exists() or \
-        (store_root / "proj" / "enriched_vectors.npz").exists()
+    assert (store_root / "proj" / "enriched_vectors.npz").exists()
+
+
+def test_relative_data_dir_is_cwd_relative_for_both_builders(tmp_path, fake_st, monkeypatch):
+    """build_flat_index and build_all must agree on what a relative data_dir means."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "svc.py").write_text(PY_SOURCE)
+    _write_config(project / "config.json")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+
+    embedder.build_flat_index(str(project), data_dir="flat")
+    embedder.build_all(str(project), data_dir="all", num_workers=1, embed_mode="cpu")
+    ASTParser._use_clang = False
+
+    assert (workdir / "flat" / "enriched_vectors.npz").exists()
+    assert (workdir / "all" / "enriched_vectors.npz").exists()
+    # Nothing may leak into the scanned project itself.
+    assert not (project / "flat").exists()
 
 
 # --- parallel parsing helpers ---

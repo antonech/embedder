@@ -20,6 +20,8 @@ System deps: `libclang-18-dev` (for C++ parsing).
 ./rebuild_index.sh --delta /path/to/project   # only changed files
 ```
 Scans project, parses AST (Python, C++, JavaScript, TypeScript, Go, Rust), embeds with sentence-transformers.
+TypeScript is parsed with the JavaScript grammar, so TS-only syntax (type annotations, interfaces,
+enums) is not extracted as its own node — functions and classes are.
 Builds per-project in `embedder_store/<project_name>/`:
 - `enriched_vectors.npz` — flat AST search
 - `tree_vectors.npz` + `tree_index.json` — hierarchical AST context (parent/children/siblings)
@@ -41,7 +43,18 @@ search("hash table lookup", rerank=False)  # bi-encoder + BM25 only (default)
 search("hash table lookup")                # auto: uses cross-encoder if loaded
 ```
 
-Registers tools: `search`, `tree_search`, `embed`, `embed_many`, `init_store`, `add_document`, `add_documents`, `save_store`, `store_info`.
+Registers tools: `search`, `embed`, `embed_many`, `store_info`, `init_store`, `add_document`,
+`add_documents`, `save_store`, `load_delta`, `clear_delta`. Every tool takes a `project` argument.
+
+AST context (parent/children/siblings) is not a separate tool — `search` attaches it to each hit
+from the tree index.
+
+`init_store` can swap in an index from any directory, so one server can search another project or
+an index built from a temporary source:
+```
+init_store("/path/to/embedder_store/other_project/enriched_vectors.npz")
+init_store("enriched_vectors.npz")   # bare filename: the directory currently served
+```
 
 ### OpenCode skill
 ```bash
@@ -69,7 +82,7 @@ Source files (.py .cpp .js .ts .go .rs ...)
     ↓
 ASTParser (Python ast / libclang / tree-sitter)
     ↓
-    EnrichmentStrategy chain (<kind> <file> <name> | signature | body | docstring)
+    EnrichmentStrategy chain (<kind> <file> <name> | signature | structure | content | docstring)
     ↓
 EmbeddingModel → VectorStore → embedder_store/<project>/
                                     ↓
@@ -122,14 +135,11 @@ probabilities [0, 1] before truncating to `top_k`. Adds ~2ms per candidate on GP
 
 Usage: `search("query", rerank=True)` — defaults to auto (enabled if model loaded).
 
-## Security notes
+## Index format
 
-- Index files (`*.npz`) store chunk texts as a length-prefixed UTF-8 blob, so loading
-  them never runs numpy's pickle deserializer. Indices built before this change are
-  rejected with a message to rebuild; set `EMBEDDER_ALLOW_PICKLE=1` to load a legacy
-  file you trust.
-- MCP tools that take a path (`init_store`, `load_delta`, `save_store`) only accept
-  `.npz` paths inside the project's store directory.
+`*.npz` files store chunk texts as a length-prefixed UTF-8 blob — smaller and faster than a numpy
+object array, and it loads without pickle. Older indices that stored a pickled `texts` array are
+still read as they are.
 
 ## Enrichment strategies
 
@@ -138,12 +148,38 @@ Applied to each AST node to build the chunk text as `<kind> <file> <name> | <str
 
 Available strategies (order matters):
 - `signature` — arguments and return type
-- `body` — method body / fields / bases summary (first N lines)
+- `structure` — owning class, methods, fields, bases (`In class: X`, `Methods: …`, `Inherits: …`)
+- `content` — prose/summary text: the body of non-code files (`.md`, `.json`, unknown types) and
+  the C++ class summary
 - `docstring` — doc comments
+- `statements` — first few source statements of a function body (**opt-in**, see below)
 - `kind` — node type (class/function/method; already in prefix)
 - `name` — symbol name (already in prefix)
+- `body` — legacy alias for `structure` + `content` + `statements`
 
-Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py UserService | find(id) | Methods: create, delete | Finds user by id`.
+Default: `["signature", "structure", "content", "docstring"]`, producing e.g.
+
+```
+Class    svc.py UserService | Methods: create_user, delete_user | Manages user records.
+Method   svc.py create_user | (self, name, email) | In class: UserService | Create a new user record.
+Function util.cpp find      | (int key) | In class: HashMap
+File     NOTES.md           | The service reads DATABASE_URL from the environment and retries…
+```
+
+### Why `statements` is opt-in
+
+Raw body lines are mostly noise for retrieval: control flow and local variable names rarely
+describe what a symbol is *for*, and they dilute the signature and docstring that do. They also
+duplicate what the tree index already covers. Enable them only if you specifically want to match
+on implementation details:
+
+```json
+"enrichment": ["signature", "structure", "content", "statements", "docstring"]
+```
+
+Statements exclude the docstring expression, so it is no longer indexed twice.
+
+**Changing `enrichment` requires a rebuild** — chunk text is baked into the vectors.
 
 ## Configuration (`config.json`)
 
@@ -152,7 +188,7 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
     "model_name": "intfloat/e5-small-v2",
     "batch_size": 4096,
     // "device": "cuda",       // uncomment for GPU-only; omit for auto multi (GPU+CPU) or CPU
-    "enrichment": ["signature", "body", "docstring"],
+    "enrichment": ["signature", "structure", "content", "docstring"],
     "use_clang": true,
     "embedding_store": "~/project/embedder_store",
     "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -166,10 +202,27 @@ Default: `["signature", "body", "docstring"]` produces e.g. `Class utils.py User
   - `"cuda"` / `"cuda:0"` / `"cuda:1"` — GPU only
   - `"cpu"` — CPU only
   - omitted — auto-detect: GPU + CPU parallel (`multi`) if CUDA available, else `"cpu"`; CLI `--embed-mode` overrides
-- `enrichment` — ordered list of strategy keys for flat chunk construction (default: `["signature", "body", "docstring"]`)
-- `use_clang` — enable libclang for C++ parsing (vs tree-sitter)
+- `enrichment` — ordered list of strategy keys for flat chunk construction
+  (default: `["signature", "structure", "content", "docstring"]`; see
+  [Enrichment strategies](#enrichment-strategies))
+- `use_clang` — try libclang first for C++ parsing. It needs the project's real include paths and
+  compile flags to resolve a translation unit; when it errors, parsing falls back to tree-sitter
+  (structured), not to raw line chunks. Set `false` to use tree-sitter directly.
 - `embedding_store` — base directory for per-project indices (supports `~` and `$VAR` expansion)
 - `query_prefix` / `passage_prefix` — override auto-detected E5/BGE instruction prefixes (set to `""` to disable)
 - `cross_encoder_model` — optional cross-encoder model for reranking (e.g. `cross-encoder/ms-marco-MiniLM-L-6-v2`); uses `device` setting
 
 Priority: explicit arg > config.json > defaults.
+
+`--data-dir` is used as given by all builders (`--build-all`, `--build-flat`, `tree_ast_parser.py`);
+a relative value is relative to the current directory, not to `--root`. Prefer absolute paths.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest                                   # offline, no model download
+python -m pytest --cov --cov-report=term-missing
+```
+
+Tests stub out sentence-transformers (`tests/conftest.py`), so they need no network and no GPU.
