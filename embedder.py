@@ -793,6 +793,9 @@ class StorageIO:
     def load(path: str) -> tuple:
         """Load vectors, texts, node_ids and dimension from a .npz file."""
         data = np.load(path, allow_pickle=False)
+        for key in ("vectors", "dim"):
+            if key not in data:
+                raise ValueError(f"{path} is not a valid index: missing '{key}'")
         vecs = data["vectors"]
         vectors = [vecs[i] for i in range(len(vecs))]
         if "texts_blob" in data:
