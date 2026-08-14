@@ -1,4 +1,4 @@
-import os, json
+import os, json, logging, sys
 
 from tree_sitter import Language, Parser
 import tree_sitter_python, tree_sitter_cpp, tree_sitter_bash
@@ -7,6 +7,8 @@ from common import (
     DEFAULT_EXCLUDE, changed_files, label_for, node_text, resolve_data_dir,
     ts_base_classes, ts_body_summary, ts_template_params,
 )
+
+log = logging.getLogger(__name__)
 
 
 LANGUAGES = {
@@ -52,8 +54,8 @@ def get_docstring(node, source: bytes) -> str:
                     s = node_text(first_in_block)
                     if '"""' in s or "'''" in s or s.strip().startswith('"'):
                         return s.strip()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.debug("cannot decode docstring candidate: %s", e)
     return ""
 
 
@@ -173,16 +175,18 @@ def parse_file(filepath: str, next_id: list | None = None, root: str = ".") -> l
 
 
 def _embed_files(files: list[str], root: str | None = None) -> tuple:
-    """Parse and embed each file, returning (model, store, nodes)."""
+    """Parse and embed each file, returning (model, store, nodes, skipped)."""
     model = EmbeddingModel()
     store = VectorStore()
     all_nodes = []
     next_id = [0]
+    skipped = 0
     for fp in sorted(files):
         try:
             nodes = parse_file(fp, next_id=next_id, **({"root": root} if root else {}))
-        except Exception as e:
-            print(f"  SKIP {fp}: {e}")
+        except Exception:
+            skipped += 1
+            log.warning("skipping %s: parse failed", fp, exc_info=True)
             continue
         if not nodes:
             continue
@@ -190,7 +194,7 @@ def _embed_files(files: list[str], root: str | None = None) -> tuple:
         store.add_many(model.embed_many(texts), texts)
         all_nodes.extend(nodes)
         print(f"  {fp}: {len(nodes)} nodes")
-    return model, store, all_nodes
+    return model, store, all_nodes, skipped
 
 
 def _save_tree_index(data_dir: str, model, store, all_nodes: list, vec_name: str, json_name: str) -> tuple[str, str]:
@@ -216,7 +220,15 @@ def build_index(root=".", data_dir=None, exclude=DEFAULT_EXCLUDE):
             if fn.endswith(exts):
                 files.append(os.path.join(dirpath, fn))
 
-    model, store, all_nodes = _embed_files(files, root=root)
+    model, store, all_nodes, skipped = _embed_files(files, root=root)
+    if skipped:
+        print(f"  WARNING: skipped {skipped}/{len(files)} files that failed to parse")
+    # Guard before writing: an all-failed run must not replace a valid index.
+    if files and skipped == len(files):
+        raise RuntimeError(
+            f"all {len(files)} files failed to parse; see log for details. "
+            f"Existing index in {data_dir} left untouched"
+        )
     vec_path, json_path = _save_tree_index(data_dir, model, store, all_nodes,
                                            "tree_vectors.npz", "tree_index.json")
     print(f"\nSaved {len(all_nodes)} nodes to {vec_path} + {json_path}")
@@ -234,7 +246,14 @@ def build_delta(root=".", data_dir=None, exclude=DEFAULT_EXCLUDE):
     changed = [f for f in changed if os.path.isfile(f) and f.endswith(exts)]
     changed = [f for f in changed if not any(x in f for x in exclude)]
 
-    model, store, all_nodes = _embed_files(changed)
+    model, store, all_nodes, skipped = _embed_files(changed, root=root)
+    if skipped:
+        print(f"  WARNING: skipped {skipped}/{len(changed)} changed files that failed to parse")
+    if changed and skipped == len(changed):
+        raise RuntimeError(
+            f"all {len(changed)} changed files failed to parse; see log for details. "
+            f"Existing delta index in {data_dir} left untouched"
+        )
     vec_path, json_path = _save_tree_index(data_dir, model, store, all_nodes,
                                            "delta_tree_vectors.npz", "delta_tree_index.json")
     print(f"\nSaved {len(all_nodes)} delta nodes to {vec_path} + {json_path}")
@@ -247,6 +266,10 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--delta", action="store_true", help="parse only files changed in HEAD")
     args = parser.parse_args()
+    logging.basicConfig(
+        level=os.environ.get("EMBEDDER_LOG_LEVEL", "WARNING").upper(), stream=sys.stderr,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     if args.delta:
         build_delta(root=args.root, data_dir=args.data_dir)
     else:

@@ -1,9 +1,12 @@
 """Shared helpers used by the embedder, tree parser and MCP server."""
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
@@ -20,14 +23,18 @@ DEFAULT_LABELS = {
 
 
 def load_json(path: str) -> dict:
-    """Read a JSON object from path, or return {} if it is missing/unreadable."""
+    """Read a JSON object from path, or return {} if it does not exist.
+
+    A file that exists but cannot be read or parsed is an error: silently
+    falling back to defaults would hide a broken config or labels file.
+    """
     if not os.path.exists(path):
         return {}
     try:
         with open(path) as f:
             return json.load(f)
-    except (OSError, ValueError):
-        return {}
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"cannot read {path}: {e}") from e
 
 
 def load_labels() -> dict:
@@ -241,17 +248,25 @@ def add_tree_context(chunks: list[str], data_dir: str, progress_steps: int = 0) 
         if not progress_steps:
             matched = sum(1 for n in node_ids if n is not None)
             print(f"  enriched {matched}/{len(chunks)} chunks with tree context")
-    except Exception as e:
-        print(f"  tree enrichment skipped: {e}")
+    except Exception:
+        log.warning("tree enrichment skipped for %s", data_dir, exc_info=True)
     return node_ids
 
 
 def changed_files(root: str) -> list[str]:
-    """Paths (relative to root) of files changed vs HEAD."""
+    """Paths (relative to root) of files changed vs HEAD.
+
+    Raises if git fails, so "not a git repository" cannot be mistaken for
+    "nothing changed" and silently produce an empty delta index.
+    """
     import subprocess
 
     result = subprocess.run(
         ["git", "diff", "--name-only", "HEAD"],
         capture_output=True, text=True, cwd=root, timeout=30,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git diff failed in {root} (exit {result.returncode}): {result.stderr.strip()}"
+        )
     return [f.strip() for f in result.stdout.splitlines() if f.strip()]

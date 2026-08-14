@@ -40,9 +40,6 @@ class TreeIndex:
             return self.nodes.get(uid)
         return None
 
-    def get_node(self, node_id: int) -> dict | None:
-        return self.nodes.get(node_id)
-
     def annotate(self, hits: list[dict]) -> list[dict]:
         for h in hits:
             nid = h.get("node_id")
@@ -68,8 +65,14 @@ class TreeIndex:
         return hits
 
     def _load(self, tree_path, start_uid=0, id_shift=0):
-        with open(tree_path) as f:
-            data = json.load(f)
+        try:
+            with open(tree_path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"cannot read tree index {tree_path}: {e}") from e
+        for key in ("nodes", "texts"):
+            if key not in data:
+                raise RuntimeError(f"tree index {tree_path} is missing '{key}'")
 
         uid = start_uid
         max_original_id_without_shift = -1
@@ -108,18 +111,21 @@ class TreeIndex:
 
         return uid, max_original_id_without_shift
 
+    def get_node(self, node_id: int) -> dict | None:
+        return self.nodes.get(node_id)
+
     def get_children(self, node_id: int) -> list[dict]:
         return [self.nodes[cid] for cid in self.children.get(node_id, []) if cid in self.nodes]
 
     def get_parent(self, node_id: int) -> dict | None:
         n = self.nodes.get(node_id)
-        if n and n["parent_id"] >= 0:
+        if n and n.get("parent_id", -1) >= 0:
             return self.nodes.get(n["parent_id"])
         return None
 
     def get_siblings(self, node_id: int) -> list[dict]:
         n = self.nodes.get(node_id)
-        if not n or n["parent_id"] < 0:
+        if not n or n.get("parent_id", -1) < 0:
             return []
         return [self.nodes[cid] for cid in self.children.get(n["parent_id"], [])
                 if cid in self.nodes and cid != node_id]
