@@ -108,6 +108,18 @@ class EmbedderApp:
 
     def init(self, data_path: str) -> str:
         data_path = self._store_path(data_path)
+        # Queries are embedded with self.model_name, so an index built with a
+        # different model scores meaningless similarities. Warn rather than raise:
+        # main() falls back to an empty store when init fails, and answering from
+        # zero vectors is worse than answering from an index whose name merely
+        # spells the model differently.
+        index_model = StorageIO.read_model_name(data_path)
+        if index_model is not None and index_model != self.model_name:
+            log.warning(
+                "index %s was built with model '%s' but queries use '%s'; "
+                "scores will be meaningless until it is rebuilt",
+                data_path, index_model, self.model_name,
+            )
         vecs, texts, dim, node_ids = StorageIO.load(data_path)
         self.store = VectorStore()
         self.store.vectors = vecs
@@ -128,6 +140,16 @@ class EmbedderApp:
             raise ValueError(
                 f"delta dimension {dim} does not match the store ({self.store.dim}); "
                 f"rebuild the delta with the same model"
+            )
+        # Equal dim does not mean equal model (384 is common across models), so a
+        # mismatch here would silently mix incompatible vectors into one cosine
+        # similarity space. Deltas built before model_name was recorded have no
+        # way to be checked and are assumed compatible.
+        delta_model = StorageIO.read_model_name(data_path)
+        if delta_model is not None and delta_model != self.model_name:
+            raise ValueError(
+                f"delta was built with model '{delta_model}', but this store uses "
+                f"'{self.model_name}'; rebuild the delta with the same model"
             )
         self.store.add_many(vecs, texts)
         self._delta_count = len(vecs)
@@ -152,6 +174,19 @@ class EmbedderApp:
             tree_vec_path = os.path.join(self.data_dir, "tree_vectors.npz")
             if os.path.exists(tree_vec_path):
                 try:
+                    # Tree vectors are scored against the same query vector and
+                    # blended into the flat results, so a different model does not
+                    # merely add noise, it distorts the ranking. Skipping tree
+                    # fusion degrades to flat-only search, which still works.
+                    tree_model = StorageIO.read_model_name(tree_vec_path)
+                    if tree_model is not None and tree_model != self.model_name:
+                        log.warning(
+                            "tree vectors %s were built with model '%s' but queries use "
+                            "'%s'; skipping tree fusion until they are rebuilt",
+                            tree_vec_path, tree_model, self.model_name,
+                        )
+                        self._tree_store = None
+                        return self._tree_store
                     tvecs, ttexts, _, _ = StorageIO.load(tree_vec_path)
                     self._tree_store = VectorStore()
                     self._tree_store.add_many(tvecs, ttexts)
@@ -431,7 +466,7 @@ class EmbedderApp:
         # node_ids must round-trip, otherwise a saved store reloaded via init_store
         # loses its tree links and falls back to regex text matching for AST context.
         StorageIO.save(path, self.store.vectors, self.store.texts, dim,
-                       node_ids=self.store.node_ids)
+                       node_ids=self.store.node_ids, model_name=self.model_name)
         return f"Saved {len(self.store)} vectors to {path}"
 
     def info(self) -> str:

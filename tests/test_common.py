@@ -194,6 +194,14 @@ def test_format_chunk_without_prefix():
     assert common.format_chunk({"kind": "Class", "file": "a.py", "name": "A"}, "") == "Class a.py A"
 
 
+def test_format_chunk_quotes_only_paths_with_whitespace():
+    # Space-free paths must stay byte-identical so existing indices keep matching.
+    plain = common.format_chunk({"kind": "Class", "file": "a.py", "name": "A"}, "x")
+    spaced = common.format_chunk({"kind": "Class", "file": "my file.py", "name": "A"}, "x")
+    assert plain == "Class a.py A | x"
+    assert spaced == 'Class "my file.py" A | x'
+
+
 class _Strategy:
     def enrich(self, node):
         return node["name"]

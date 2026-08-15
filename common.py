@@ -347,8 +347,17 @@ def ts_body_summary(node, max_methods: int = 8, max_fields: int = 6) -> str:
 
 
 def format_chunk(node: dict, enriched: str) -> str:
-    """Prefix an enriched node with '<kind> <file> <name>'."""
-    prefix = f"{node.get('kind', '')} {node.get('file', '')} {node.get('name', '')}".strip()
+    """Prefix an enriched node with '<kind> <file> <name>'.
+
+    A path containing whitespace is quoted, because TreeIndex.match_node reads the
+    file back out of this text to find the chunk's tree node and would otherwise
+    stop at the first space — silently costing those files their AST context.
+    Space-free paths are left bare so existing indices stay byte-identical.
+    """
+    file = node.get('file', '')
+    if file and any(c.isspace() for c in file):
+        file = f'"{file}"'
+    prefix = f"{node.get('kind', '')} {file} {node.get('name', '')}".strip()
     if not prefix:
         return enriched
     return f"{prefix} | {enriched}" if enriched else prefix

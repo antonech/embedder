@@ -712,6 +712,7 @@ class EmbeddingModel:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", device: Optional[str] = None,
                  query_prefix: str | None = None, passage_prefix: str | None = None,
                  float_type: str = "fp32"):
+        self.model_name = model_name
         self.model = SentenceTransformer(model_name, device=device)
         if float_type == "fp16":
             self.model.half()
@@ -871,7 +872,7 @@ class StorageIO:
 
     @staticmethod
     def save(path: str, vectors: np.ndarray | list[np.ndarray], texts: list[str], dim: int,
-             node_ids: list[int | None] | None = None) -> None:
+             node_ids: list[int | None] | None = None, model_name: str | None = None) -> None:
         if isinstance(vectors, list):
             vecs_array = np.stack(vectors) if vectors else np.array([])
         else:
@@ -892,6 +893,8 @@ class StorageIO:
             data["node_ids"] = np.array(
                 [nid if nid is not None else -1 for nid in node_ids], dtype=np.int32
             )
+        if model_name is not None:
+            data["model_name"] = np.array(model_name)
         np.savez_compressed(path, **data)
 
     @staticmethod
@@ -923,6 +926,18 @@ class StorageIO:
             node_ids = [int(x) if x >= 0 else None for x in raw]
         return vectors, texts, dim, node_ids
 
+    @staticmethod
+    def read_model_name(path: str) -> str | None:
+        """Peek at the embedding model name an .npz was built with, or None if absent.
+
+        Indices written before this field existed (or written with model_name=None)
+        have no way to be checked and are treated as compatible with anything.
+        """
+        data = np.load(path, allow_pickle=False)
+        if "model_name" not in data:
+            return None
+        return str(data["model_name"])
+
 
 def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False) -> None:
     """Build flat vector index for a project.
@@ -947,7 +962,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         delta_texts_path = os.path.join(data_dir, 'delta_texts.json')
 
         def _save_empty_delta(files: list[str]) -> None:
-            StorageIO.save(delta_vec_path, [], [], enc.dim)
+            StorageIO.save(delta_vec_path, [], [], enc.dim, model_name=cfg.model_name)
             with open(delta_texts_path, 'w') as f:
                 json.dump({"files": files, "texts": [], "model": cfg.model_name}, f)
 
@@ -975,7 +990,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
 
         vecs = enc.embed_many(enc.as_passages(chunks))
 
-        StorageIO.save(delta_vec_path, vecs, chunks, enc.dim)
+        StorageIO.save(delta_vec_path, vecs, chunks, enc.dim, model_name=cfg.model_name)
 
         with open(delta_texts_path, 'w') as f:
             json.dump({"files": changed, "texts": chunks, "model": cfg.model_name}, f,
@@ -993,7 +1008,7 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         vecs = enc.embed_many(enc.as_passages(chunks))
 
         out = os.path.join(data_dir, 'enriched_vectors.npz')
-        StorageIO.save(out, vecs, chunks, enc.dim, node_ids=node_ids)
+        StorageIO.save(out, vecs, chunks, enc.dim, node_ids=node_ids, model_name=cfg.model_name)
         print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 
@@ -1157,7 +1172,8 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
         # Save tree index
         tree_vec_path = os.path.join(data_dir, "tree_vectors.npz")
         if tree_vecs.size and enc_tree is not None:
-            StorageIO.save(tree_vec_path, tree_vecs, tree_texts, enc_tree.dim)
+            StorageIO.save(tree_vec_path, tree_vecs, tree_texts, enc_tree.dim,
+                           model_name=cfg.model_name)
             write_tree_index(tree_json_path, all_tree_nodes, tree_texts)
             print(f"Tree index: {len(all_tree_nodes)} nodes -> {tree_vec_path} + {tree_json_path}", flush=True)
         else:
@@ -1241,7 +1257,7 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
 
     out = os.path.join(data_dir, "enriched_vectors.npz")
     flat_dim = (enc_gpu or enc_cpu).dim
-    StorageIO.save(out, vecs, chunks, flat_dim, node_ids=node_ids)
+    StorageIO.save(out, vecs, chunks, flat_dim, node_ids=node_ids, model_name=cfg.model_name)
     print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 
