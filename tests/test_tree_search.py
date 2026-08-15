@@ -114,6 +114,26 @@ def test_match_node(data_dir, text, expected):
     assert (node["name"] if node else None) == expected
 
 
+def test_match_node_resolves_a_quoted_path_containing_spaces(tmp_path):
+    # A bare 'my file.py' would be read as file='my', name='file.py' and silently
+    # lose tree context, so common.format_chunk quotes such paths.
+    nodes = [
+        _node(0, "Service", file="my file.py", type="class_definition", start=1, end=20),
+        _node(1, "run", file="my file.py", parent_id=0, start=2, end=5),
+        _node(2, "Service", file="plain.py", type="class_definition", start=1, end=20),
+    ]
+    _write(tmp_path / "tree_index.json", nodes)
+    idx = TreeIndex(data_dir=str(tmp_path))
+
+    spaced = idx.match_node('Class "my file.py" Service | Methods: run')
+    assert spaced["file"] == "my file.py" and spaced["start_line"] == 1
+    assert [c["name"] for c in idx.get_children(spaced["_uid"])] == ["run"]
+    # The '. Parent: X' suffix add_tree_context appends must not break the match.
+    assert idx.match_node('Class "my file.py" Service | x. Parent: Service')["file"] == "my file.py"
+    # Unquoted paths keep working unchanged.
+    assert idx.match_node("Class plain.py Service | Methods: run")["file"] == "plain.py"
+
+
 def test_match_node_disambiguates_method_from_module_function(tmp_path):
     nodes = [
         _node(0, "Service", type="class_definition", start=1, end=20),

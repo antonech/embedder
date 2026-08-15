@@ -97,12 +97,17 @@ class TreeIndex:
                 return uid
         return uids[0]
 
+    # '<kind> <file> <name>' as written by common.format_chunk, where a path
+    # containing whitespace is quoted. Left-anchored, so the '. Parent: X' suffix
+    # add_tree_context appends to a chunk does not affect the match.
+    _PREFIX_RE = re.compile(r'^\S+\s+(?:"([^"]*)"|(\S+))\s+(\S+)')
+
     def match_node(self, text: str) -> "TreeNode | None":
-        m = re.match(r'^\S+\s+(\S+)\s+(\S+)', text)
+        m = self._PREFIX_RE.match(text)
         if not m:
             return None
-        file = m.group(1)
-        name = m.group(2).rstrip(".,;:!?(){}[]")
+        file = m.group(1) if m.group(1) is not None else m.group(2)
+        name = m.group(3).rstrip(".,;:!?(){}[]")
         uids = self.name_uids.get((file, name))
         if not uids:
             return None

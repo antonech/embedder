@@ -201,7 +201,8 @@ def _save_tree_index(data_dir: str, model, store, all_nodes: list, vec_name: str
     os.makedirs(data_dir, exist_ok=True)
     vec_path = os.path.join(data_dir, vec_name)
     json_path = os.path.join(data_dir, json_name)
-    StorageIO.save(vec_path, store.vectors, store.texts, model.dim)
+    StorageIO.save(vec_path, store.vectors, store.texts, model.dim,
+                   model_name=model.model_name)
     write_tree_index(json_path, all_nodes, store.texts)
     return vec_path, json_path
 

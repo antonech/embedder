@@ -619,6 +619,18 @@ def test_storage_save_empty(tmp_path):
     assert len(vecs) == 0 and texts == [] and dim == 3 and node_ids is None
 
 
+def test_storage_read_model_name_round_trips(tmp_path):
+    path = str(tmp_path / "vecs.npz")
+    StorageIO.save(path, np.stack([_unit(1, 0)]), ["a"], dim=2, model_name="e5-small-v2")
+    assert StorageIO.read_model_name(path) == "e5-small-v2"
+
+
+def test_storage_read_model_name_is_none_when_absent(tmp_path):
+    path = str(tmp_path / "vecs.npz")
+    StorageIO.save(path, np.stack([_unit(1, 0)]), ["a"], dim=2)
+    assert StorageIO.read_model_name(path) is None
+
+
 # --- build_flat_index ---
 
 def _write_config(path, **overrides):

@@ -222,6 +222,60 @@ def test_load_delta_rejects_dimension_mismatch(app, store_path, tmp_path):
     assert app.search("user", top_k=1)
 
 
+def test_load_delta_rejects_model_mismatch_even_with_equal_dim(app, store_path, tmp_path):
+    # Equal dim (very common at 384) does not mean equal model; mixing embeddings
+    # from two models into one store would silently corrupt every similarity score.
+    app.init(str(store_path))
+    enc = FakeEncoder()
+    delta_texts = ["Function new.py added_fn | brand new"]
+    delta_path = tmp_path / "delta.npz"
+    StorageIO.save(str(delta_path), enc.embed_many(delta_texts), delta_texts, enc.dim,
+                   model_name="a-different-model")
+
+    with pytest.raises(ValueError, match="a-different-model"):
+        app.load_delta(str(delta_path))
+    assert app.store.texts == TEXTS
+
+
+def test_init_warns_but_still_loads_an_index_from_another_model(app, tmp_path, caplog):
+    # Raising here would be worse than warning: main() falls back to an empty
+    # store when init fails, so a mismatch would leave the server serving nothing.
+    enc = FakeEncoder()
+    path = tmp_path / "foreign.npz"
+    StorageIO.save(str(path), enc.embed_many(TEXTS), TEXTS, enc.dim,
+                   model_name="some-other-model")
+
+    with caplog.at_level("WARNING"):
+        assert app.init(str(path)).startswith(f"Loaded {len(TEXTS)} vectors")
+    assert "some-other-model" in caplog.text
+    assert len(app.store) == len(TEXTS)
+
+
+def test_tree_fusion_is_skipped_when_tree_vectors_use_another_model(app, tree_dir, caplog):
+    app.init(str(tree_dir / "enriched_vectors.npz"))
+    enc = FakeEncoder()
+    tree_texts = ["Class svc.py Service"]
+    StorageIO.save(str(tree_dir / "tree_vectors.npz"), enc.embed_many(tree_texts),
+                   tree_texts, enc.dim, model_name="some-other-model")
+    app._invalidate_tree_caches()
+
+    with caplog.at_level("WARNING"):
+        assert app._get_tree_store() is None
+    assert "skipping tree fusion" in caplog.text
+    # Flat-only search still works.
+    assert app.search("user", top_k=1)
+
+
+def test_load_delta_allows_legacy_delta_without_model_name(app, store_path, tmp_path):
+    app.init(str(store_path))
+    enc = FakeEncoder()
+    delta_texts = ["Function new.py added_fn | brand new"]
+    delta_path = tmp_path / "delta.npz"
+    StorageIO.save(str(delta_path), enc.embed_many(delta_texts), delta_texts, enc.dim)
+
+    assert app.load_delta(str(delta_path)) == "Loaded 1 delta vectors"
+
+
 # --- formatting ---
 
 def test_format_text_and_json():

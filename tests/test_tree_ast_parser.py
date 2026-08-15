@@ -231,6 +231,7 @@ def test_resolve_data_dir_config_without_store(tmp_path, monkeypatch):
 
 class _StubModel:
     dim = 3
+    model_name = "stub-model"
 
     def embed_many(self, texts):
         import numpy as np
