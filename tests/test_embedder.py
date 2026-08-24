@@ -583,6 +583,28 @@ def test_vector_store_empty_search_and_dim():
     assert store.search(_unit(1, 0)) == []
 
 
+def test_vector_store_search_top_k_edges():
+    # top_k selection partitions rather than sorting everything, so the boundaries
+    # (k larger than the store, k == the store, k <= 0) need to stay well-defined.
+    store = VectorStore()
+    store.add_many(np.stack([_unit(1, 0), _unit(0, 1), _unit(1, 1)]), ["a", "b", "c"])
+
+    assert [h["text"] for h in store.search(_unit(1, 0), top_k=99)] == ["a", "c", "b"]
+    assert [h["text"] for h in store.search(_unit(1, 0), top_k=3)] == ["a", "c", "b"]
+    assert [h["text"] for h in store.search(_unit(1, 0), top_k=1)] == ["a"]
+    assert store.search(_unit(1, 0), top_k=0) == []
+
+
+def test_vector_store_search_orders_by_score_descending():
+    store = VectorStore()
+    vecs = [_unit(1, 0), _unit(3, 1), _unit(1, 1), _unit(1, 3), _unit(0, 1)]
+    store.add_many(np.stack(vecs), list("abcde"))
+    hits = store.search(_unit(1, 0), top_k=4)
+    scores = [h["score"] for h in hits]
+    assert scores == sorted(scores, reverse=True)
+    assert [h["text"] for h in hits] == ["a", "b", "c", "d"]
+
+
 # --- StorageIO ---
 
 def test_storage_roundtrip_with_node_ids(tmp_path):
