@@ -330,6 +330,51 @@ def test_rerank_single_hit(app):
     assert len(out) == 1 and out[0]["score"] > 0.5
 
 
+class _Holder:
+    """Stands in for a tensor: _rerank only calls .to(device) on tokenizer output."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def to(self, device):
+        return self
+
+
+class _PairAwareCrossEncoder:
+    """Scores each pair by its own text, so misaligned scores are detectable."""
+
+    device = "cpu"
+
+    def __init__(self, by_text):
+        self.by_text = by_text
+
+    def __call__(self, **inputs):
+        import torch
+
+        return type("Out", (), {
+            "logits": torch.tensor([self.by_text[t] for t in inputs["texts"].value]).unsqueeze(-1)
+        })()
+
+
+def test_rerank_keeps_each_score_with_its_own_hit_across_batches(app, monkeypatch):
+    # Pairs are scored shortest-first to cut padding, so the model sees them in a
+    # different order than `hits`. Every score must be written back to the hit it
+    # was computed for, including across batch boundaries.
+    monkeypatch.setattr(mcp_server, "RERANK_BATCH", 2)
+    by_text = {"dddd": 1.0, "b": 2.0, "ccc": 3.0, "aa": 4.0}
+    app.cross_encoder = _PairAwareCrossEncoder(by_text)
+    app.cross_encoder_tokenizer = (
+        lambda pairs, padding, truncation, return_tensors: {"texts": _Holder([p[1] for p in pairs])}
+    )
+
+    hits = [{"text": t, "score": 0.0} for t in ["dddd", "b", "ccc", "aa"]]
+    out = app._rerank("q", hits, top_k=4)
+
+    # Highest logit first; a sort/unsort slip would permute these.
+    assert [h["text"] for h in out] == ["aa", "ccc", "b", "dddd"]
+    assert [h["score"] for h in out] == sorted((h["score"] for h in out), reverse=True)
+
+
 # --- query expansion & search ---
 
 def test_expand_query_without_bm25(app):
