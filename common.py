@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -341,6 +342,21 @@ def ts_body_summary(node, max_methods: int = 8, max_fields: int = 6) -> str:
     if fields:
         result.append("Fields: " + ", ".join(fields[:max_fields]))
     return ". ".join(result) if result else ""
+
+
+def bm25_tokenize(text: str) -> list[str]:
+    """Split chunk text into BM25 tokens.
+
+    Shared by the index builders (which persist postings derived from these
+    tokens) and the query path, so the two can never tokenize differently.
+    """
+    result = []
+    for w in re.split(r'[^a-zA-Z0-9]+', text):
+        if not w:
+            continue
+        for p in re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|\d+', w):
+            result.append(p.lower())
+    return result
 
 
 # --- chunk helpers ---

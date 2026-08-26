@@ -158,6 +158,13 @@ Vectors are held as a single `(N, dim)` matrix rather than a list of rows plus a
 same data; on that index the flat store went from ~1.9 GB to ~1.25 GB resident, and a full server
 (model + flat index + tree index + BM25) from 3.2 GB to 2.4 GB.
 
+BM25 postings (`bm25.py`) are computed once by the index builders and persisted inside the same
+`.npz` (`bm25_*` keys). Loading them takes ~0.16 s instead of re-tokenizing the whole corpus
+(~10.6 s on clickhouse), scoring touches only documents containing the query terms (~0.7 ms vs
+~175 ms median per query), and deltas/`add_document` extend a small in-memory overlay instead of
+rebuilding. Scores match `rank_bm25.BM25Okapi` to within 1e-14 on the real index. Indices without
+postings fall back to `rank_bm25` unchanged. Rebuild to get them.
+
 ## Enrichment strategies
 
 Configured in `config.json` under `"enrichment"` key (array of strategy names).

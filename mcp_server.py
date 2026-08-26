@@ -3,11 +3,11 @@ import json
 import asyncio
 import argparse
 import logging
-import re
 import sys
 import numpy as np
 from mcp.server.fastmcp import FastMCP
-from common import ModelConfig, project_data_dir, resolve_device
+from bm25 import BM25Scorer, Postings
+from common import ModelConfig, bm25_tokenize, project_data_dir, resolve_device
 from embedder import EmbeddingModel, StorageIO, VectorStore
 from tree_search import TreeIndex
 
@@ -46,6 +46,12 @@ class EmbedderApp:
         self.store = VectorStore()
         self._bm25 = None
         self._bm25_dirty = False
+        # Persisted postings path: base tier from the index file plus overlay tiers
+        # for delta and added documents. When the index has no postings (written
+        # before they existed) both stay empty and the legacy rank_bm25 path runs.
+        self._bm25_base: Postings | None = None
+        self._overlay_tokens: list[list[str]] = []
+        self._bm25_scorer: BM25Scorer | None = None
         self._delta_count = 0
         self.cross_encoder = None
         self.cross_encoder_tokenizer = None
@@ -67,16 +73,7 @@ class EmbedderApp:
         return path if os.path.isabs(path) else os.path.join(self.data_dir, path)
 
     def _tokenize(self, text: str) -> list[str]:
-        words = re.split(r'[^a-zA-Z0-9]+', text)
-        result = []
-        for w in words:
-            if not w:
-                continue
-            parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\b)|\d+', w)
-            for p in parts:
-                p = p.lower()
-                result.append(p)
-        return result
+        return bm25_tokenize(text)
 
     def _build_bm25(self):
         self._bm25_dirty = False
@@ -91,10 +88,45 @@ class EmbedderApp:
         """Rebuild BM25 if documents were added since the last build.
 
         Deferring keeps repeated add_document calls O(1) instead of retokenizing
-        the whole corpus per insert.
+        the whole corpus per insert. Only the legacy path needs this: with
+        persisted postings, mutations update the overlay directly.
         """
         if self._bm25_dirty:
             self._build_bm25()
+
+    def _has_bm25(self) -> bool:
+        return self._bm25_base is not None or self._bm25 is not None
+
+    def _bm25_scores(self, tokens: list[str]) -> np.ndarray:
+        """Dense per-document BM25 scores for the whole store."""
+        if self._bm25_base is not None:
+            if self._bm25_scorer is None:
+                overlay = (Postings.build(self._overlay_tokens,
+                                          id_offset=self._bm25_base.n_docs)
+                           if self._overlay_tokens else None)
+                self._bm25_scorer = BM25Scorer(
+                    self._bm25_base, [overlay] if overlay else [])
+            return self._bm25_scorer.get_scores(tokens)
+        return self._bm25.get_scores(tokens)
+
+    def _bm25_idf(self, term: str) -> float:
+        if self._bm25_base is not None:
+            if self._bm25_scorer is None:
+                self._bm25_scores([])
+            return self._bm25_scorer.idf(term)
+        return self._bm25.idf.get(term, 0.0)
+
+    def _bm25_append(self, texts: list[str]) -> None:
+        """Fold newly added documents into BM25.
+
+        Fast path records tokens only; the combined scorer is rebuilt lazily on
+        the next query. Legacy path just marks the corpus dirty, as before.
+        """
+        if self._bm25_base is None:
+            self._bm25_dirty = True
+            return
+        self._overlay_tokens.extend(self._tokenize(t) for t in texts)
+        self._bm25_scorer = None
 
     def _invalidate_tree_caches(self) -> None:
         """Drop cached tree index/vectors and the tree->flat map.
@@ -116,7 +148,20 @@ class EmbedderApp:
         self._delta_count = 0
         self.data_dir = os.path.dirname(data_path)
         self._invalidate_tree_caches()
-        self._build_bm25()
+        self._bm25_base = StorageIO.load_bm25(data_path)
+        self._overlay_tokens = []
+        self._bm25_scorer = None
+        if self._bm25_base is not None and self._bm25_base.n_docs != len(self.store):
+            # Postings must describe the store row for row; a mismatched file is
+            # worse than none.
+            log.warning("BM25 postings in %s cover %d docs but the store has %d; "
+                        "rebuilding BM25 from texts", data_path,
+                        self._bm25_base.n_docs, len(self.store))
+            self._bm25_base = None
+        if self._bm25_base is None:
+            # Legacy index without persisted postings: build BM25 from the texts,
+            # retokenizing the whole corpus as before.
+            self._build_bm25()
         return f"Loaded {len(self.store)} vectors, dim={dim}"
 
     def load_delta(self, data_path: str) -> str:
@@ -131,15 +176,24 @@ class EmbedderApp:
             )
         self.store.add_many(vecs, texts)
         self._delta_count = len(vecs)
-        self._build_bm25()
+        if self._bm25_base is None:
+            self._build_bm25()
+        else:
+            self._bm25_append(texts)
         return f"Loaded {len(vecs)} delta vectors"
 
     def clear_delta(self) -> str:
         if self._delta_count < 1:
             return "No delta to clear"
         self.store.truncate(len(self.store) - self._delta_count)
+        if self._bm25_base is None:
+            self._build_bm25()
+        else:
+            # Overlay rows align 1:1 with store rows past the base, and truncate
+            # dropped the last _delta_count store rows.
+            del self._overlay_tokens[len(self._overlay_tokens) - self._delta_count:]
+            self._bm25_scorer = None
         self._delta_count = 0
-        self._build_bm25()
         return "Delta cleared"
 
     def _get_tree(self):
@@ -290,7 +344,7 @@ class EmbedderApp:
 
     def _expand_query(self, query: str, qv, top_k: int = 5, max_terms: int = 5) -> list[str]:
         """Expand BM25 query via pseudo-relevance feedback from embedding hits."""
-        if not self._bm25 or len(self.store) == 0:
+        if not self._has_bm25() or len(self.store) == 0:
             return self._tokenize(query)
         hits = self.store.search(qv, top_k=top_k)
         if not hits:
@@ -307,7 +361,7 @@ class EmbedderApp:
 
         scored = []
         for term, df in term_doc_count.items():
-            idf = self._bm25.idf.get(term, 0.0)
+            idf = self._bm25_idf(term)
             scored.append((idf * df, term))
 
         scored.sort(reverse=True)
@@ -343,13 +397,18 @@ class EmbedderApp:
 
     def _candidates(self, query: str, qv, top_k: int, mode: str, alpha: float | None) -> list[dict]:
         self._ensure_bm25()
-        if mode == "embed" or self._bm25 is None:
+        if mode == "embed" or not self._has_bm25():
             return self.store.search(qv, top_k=top_k)
 
         tokenized = self._expand_query(query, qv, top_k=top_k)
         n = len(self.store)
-        bm25_raw = self._bm25.get_scores(tokenized)
-        bm25_top = sorted(range(n), key=lambda i: bm25_raw[i], reverse=True)[:top_k * 3]
+        bm25_raw = self._bm25_scores(tokenized)
+        # Only the top_k*3 rows matter; partition instead of a Python sort over all
+        # N rows. Same tie-order caveat as VectorStore.search: exactly-equal scores
+        # may be returned in a different order than before.
+        k = min(top_k * 3, n)
+        top_arr = np.argpartition(-bm25_raw, k - 1)[:k]
+        bm25_top = top_arr[np.argsort(-bm25_raw[top_arr])]
 
         if alpha is None:
             alpha = 0.7
@@ -403,13 +462,13 @@ class EmbedderApp:
 
     def add_document(self, text: str) -> str:
         self.store.add(self.encoder.embed_passage(text), text)
-        self._bm25_dirty = True
+        self._bm25_append([text])
         return f"Added, total vectors: {len(self.store)}"
 
     def add_documents(self, texts: list[str]) -> str:
         vecs = self.encoder.embed_many(self.encoder.as_passages(texts))
         self.store.add_many(vecs, texts)
-        self._bm25_dirty = True
+        self._bm25_append(texts)
         return f"Added {len(texts)} docs, total vectors: {len(self.store)}"
 
     def save(self, path: str) -> str:
@@ -420,8 +479,17 @@ class EmbedderApp:
         dim = self.encoder.dim
         # node_ids must round-trip, otherwise a saved store reloaded via init_store
         # loses its tree links and falls back to regex text matching for AST context.
+        bm25_arrays = None
+        if self._bm25_base is not None:
+            # Persist the postings too, merging the overlay in, so the saved store
+            # keeps the fast BM25 path instead of falling back to a full rebuild.
+            tiers = [self._bm25_base]
+            if self._overlay_tokens:
+                tiers.append(Postings.build(self._overlay_tokens,
+                                            id_offset=self._bm25_base.n_docs))
+            bm25_arrays = (tiers[0] if len(tiers) == 1 else Postings.merge(tiers)).to_arrays()
         StorageIO.save(path, self.store.vectors, self.store.texts, dim,
-                       node_ids=self.store.node_ids)
+                       node_ids=self.store.node_ids, bm25_arrays=bm25_arrays)
         return f"Saved {len(self.store)} vectors to {path}"
 
     def info(self) -> str:

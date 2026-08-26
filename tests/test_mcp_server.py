@@ -4,47 +4,8 @@ import numpy as np
 import pytest
 
 import mcp_server
-from conftest import FakeSentenceTransformer
+from conftest import FakeEncoder, FakeSentenceTransformer
 from embedder import StorageIO
-
-
-class FakeEncoder:
-    """Stand-in for EmbeddingModel (deterministic, no model download)."""
-
-    def __init__(self, model_name="fake", device=None, float_type="fp32"):
-        self.model_name = model_name
-        self.device = device
-        self.float_type = float_type
-        self.dim = FakeSentenceTransformer.DIM
-        self.query_prefix = ""
-        self.passage_prefix = ""
-        self._st = FakeSentenceTransformer(model_name, device)
-
-    def embed(self, text):
-        return self._st.encode(text)
-
-    def embed_many(self, texts):
-        return self._st.encode(list(texts))
-
-    def as_passages(self, texts):
-        return [self.passage_prefix + t for t in texts] if self.passage_prefix else list(texts)
-
-    def embed_passage(self, text):
-        return self.embed(self.passage_prefix + text if self.passage_prefix else text)
-
-    def embed_query(self, query):
-        return self.embed(self.query_prefix + query if self.query_prefix else query)
-
-
-@pytest.fixture
-def fake_encoder(monkeypatch):
-    monkeypatch.setattr(mcp_server, "EmbeddingModel", FakeEncoder)
-    return FakeEncoder
-
-
-@pytest.fixture
-def app(fake_encoder, tmp_path):
-    return mcp_server.EmbedderApp("proj", "fake-model", data_dir=str(tmp_path))
 
 
 TEXTS = [

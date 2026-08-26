@@ -5,10 +5,11 @@ from typing import Optional
 from abc import ABC, abstractmethod
 from sentence_transformers import SentenceTransformer
 
+from bm25 import Postings
 from common import (
     DEFAULT_EXCLUDE, LABELS as _LABELS, ModelConfig,
     SKIP_DIRS as _SKIP_DIRS, SKIP_PREFIXES as _SKIP_PREFIXES,
-    add_tree_context, changed_files, enrich_chunks, label_for,
+    add_tree_context, bm25_tokenize, changed_files, enrich_chunks, label_for,
     load_project_config, node_text, resolve_data_dir, ts_base_classes,
     ts_body_summary, ts_declarator_name, write_tree_index,
 )
@@ -864,7 +865,8 @@ class StorageIO:
 
     @staticmethod
     def save(path: str, vectors: np.ndarray | list[np.ndarray], texts: list[str], dim: int,
-             node_ids: list[int | None] | None = None) -> None:
+             node_ids: list[int | None] | None = None,
+             bm25_arrays: dict | None = None) -> None:
         if isinstance(vectors, list):
             vecs_array = np.stack(vectors) if vectors else np.array([])
         else:
@@ -885,6 +887,8 @@ class StorageIO:
             data["node_ids"] = np.array(
                 [nid if nid is not None else -1 for nid in node_ids], dtype=np.int32
             )
+        if bm25_arrays is not None:
+            data.update(bm25_arrays)
         np.savez_compressed(path, **data)
 
     @staticmethod
@@ -915,6 +919,21 @@ class StorageIO:
             raw = data["node_ids"]
             node_ids = [int(x) if x >= 0 else None for x in raw]
         return vectors, texts, dim, node_ids
+
+    @staticmethod
+    def load_bm25(path: str):
+        """Read the persisted BM25 postings from an index file, or None if absent.
+
+        Kept separate from load() so reading them does not force the vectors and
+        texts into memory, and so indices written before postings existed (which
+        have no bm25_* keys) simply fall back to rank_bm25.
+        """
+        from bm25 import Postings
+
+        data = np.load(path, allow_pickle=False)
+        if "bm25_post_offsets" not in data:
+            return None
+        return Postings.from_arrays(data)
 
 
 def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False) -> None:
@@ -986,7 +1005,8 @@ def build_flat_index(root: str, data_dir: str | None = None, delta: bool = False
         vecs = enc.embed_many(enc.as_passages(chunks))
 
         out = os.path.join(data_dir, 'enriched_vectors.npz')
-        StorageIO.save(out, vecs, chunks, enc.dim, node_ids=node_ids)
+        StorageIO.save(out, vecs, chunks, enc.dim, node_ids=node_ids,
+                       bm25_arrays=Postings.build([bm25_tokenize(c) for c in chunks]).to_arrays())
         print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 
@@ -1234,7 +1254,8 @@ def build_all(root: str, data_dir: str | None = None, num_workers: int | None = 
 
     out = os.path.join(data_dir, "enriched_vectors.npz")
     flat_dim = (enc_gpu or enc_cpu).dim
-    StorageIO.save(out, vecs, chunks, flat_dim, node_ids=node_ids)
+    StorageIO.save(out, vecs, chunks, flat_dim, node_ids=node_ids,
+                   bm25_arrays=Postings.build([bm25_tokenize(c) for c in chunks]).to_arrays())
     print(f"Flat index: {len(chunks)} chunks -> {out}")
 
 

@@ -63,7 +63,7 @@ scratch store without editing the repo, **copy** the modules into a scratch dir 
 
 ```bash
 mkdir /tmp/srv && cd /tmp/srv
-cp <repo>/{embedder.py,mcp_server.py,tree_search.py,tree_ast_parser.py,common.py,labels.json} .
+cp <repo>/{embedder.py,mcp_server.py,tree_search.py,tree_ast_parser.py,common.py,bm25.py,labels.json} .
 # config.json with "embedding_store": "/tmp/store"
 ```
 Then `python mcp_server.py --project <name>` loads `/tmp/store/<name>/enriched_vectors.npz`.
@@ -135,12 +135,15 @@ for c in ASTParser.scan_project('/tmp/sample'): print(' *', c)"
 These were all bugs at some point; each has a unit-test guard now, so break them and the suite
 should go red:
 
-- `load_delta`/`clear_delta` rebuild the BM25 index. Without it, `search` in `rrf`/`bm25`/alpha
-  mode after a delta load raises `IndexError: index N is out of bounds for axis 0 with size M`.
+- BM25 has two paths. Indices with persisted postings (`bm25_*` keys in the `.npz`, built by
+  current `build_flat_index`/`build_all`) load them in ~0.1s; `load_delta`/`clear_delta`/
+  `add_document(s)` update a small overlay, so `app._overlay_tokens` moves and no rebuild happens.
+  Older indices fall back to `rank_bm25`: `load_delta`/`clear_delta` rebuild it eagerly and
+  `add_document(s)` mark `app._bm25_dirty` for a lazy rebuild on the next query. Without either,
+  `search` in `rrf`/`bm25`/alpha mode after a delta load raises
+  `IndexError: index N is out of bounds for axis 0 with size M`.
 - `init()` clears `_tree`, `_tree_store` **and** `_tree_to_flat`. The map is keyed by flat index,
   so a stale entry silently boosts an unrelated chunk in `_fuse_with_tree` — wrong scores, no error.
-- `add_document`/`add_documents` only mark BM25 dirty; `_candidates` rebuilds it lazily. Assert via
-  `app._bm25_dirty`, not by expecting an immediate rebuild.
 - `init_store`/`load_delta`/`save_store` take paths as given: any `.npz` is loadable, including
   another project's index. A bare filename resolves against the directory currently being served
   (`data_dir`). There is deliberately **no path sandbox** — this is a local single-user tool driven
